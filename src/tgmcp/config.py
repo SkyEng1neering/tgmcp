@@ -158,7 +158,10 @@ def load_config(env: dict | None = None, env_file: str | Path | None = None) -> 
             raise ConfigError(f"{name} must be >= {minimum}")
         return value
 
-    port = num("MCP_PORT", int(env.get("PORT") or 8000), minimum=1)
+    port = num("MCP_PORT", num("PORT", 8000, minimum=1), minimum=1)
+    log_level = (env.get("LOG_LEVEL") or "INFO").strip().upper()
+    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        raise ConfigError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
 
     return Config(
         api_id=api_id,
@@ -172,7 +175,7 @@ def load_config(env: dict | None = None, env_file: str | Path | None = None) -> 
         allow_no_auth=allow_no_auth,
         proxy=_parse_proxy(env.get("TG_PROXY")),
         max_message_chars=num("TG_MAX_MESSAGE_CHARS", 1500, minimum=0),
-        log_level=(env.get("LOG_LEVEL") or "INFO").strip().upper(),
+        log_level=log_level,
         max_concurrent_calls=num("MCP_MAX_CONCURRENT_CALLS", 8, minimum=1),
         queue_timeout=num("MCP_QUEUE_TIMEOUT", 120.0, float, minimum=1),
         max_queue=num("MCP_MAX_QUEUE", 200, minimum=0),

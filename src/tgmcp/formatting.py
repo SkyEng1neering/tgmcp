@@ -51,6 +51,7 @@ class MsgView:
     edited: bool = False
     reactions: int | None = None
     sender_id: int | None = None
+    service: bool = False
 
     @property
     def key(self) -> tuple[int, int]:
@@ -69,8 +70,10 @@ def truncate(text: str, limit: int) -> str:
     return text[:limit].rstrip() + f" …[+{len(text) - limit} chars]"
 
 
-def format_message(m: MsgView, max_chars: int = 1500, show_chat: bool = True, indent: str = "") -> str:
-    head = []
+def format_message(
+    m: MsgView, max_chars: int = 1500, show_chat: bool = True, indent: str = "", label: str | None = None
+) -> str:
+    head = [f"({label})"] if label else []
     if show_chat:
         head.append(f"[{m.chat.title}]")
     head.append(f"#{m.id}")

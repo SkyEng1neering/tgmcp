@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from datetime import timedelta
 from typing import Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -13,7 +14,7 @@ from pydantic import Field
 from . import __version__
 from .formatting import fmt_date, format_chat, format_message, format_messages
 from .limits import BusyError, CallGate
-from .telegram import AccessError, Discussion, TelegramService, parse_when
+from .telegram import AccessError, Discussion, FollowUp, TelegramService, parse_when
 
 INSTRUCTIONS = """\
 This server gives read-only access to a fixed list of Telegram chats (communities, channels, forums)
@@ -22,7 +23,9 @@ so you can find what people asked, discussed and answered there. You cannot send
 Suggested workflow:
 1. `list_chats` once to see which chats exist and what they are about.
 2. `search_discussions` for "how did people solve X / what do people think about Y" questions — it
-   returns whole threads (question + answers). Use `search_messages` for quick fact lookups and
+   returns whole conversations: the question, reply-linked answers AND the messages written right after it
+   without the reply button (tagged "after"; many people answer that way, but some of those are unrelated
+   chatter — judge by content). When a hit is a loose answer, the messages just before it are shown too. Use `search_messages` for quick fact lookups and
    `find_questions` to see what people ask about a topic (optionally with answers / only unanswered).
 3. Drill down with `get_thread`, `get_message_context` (messages around a hit — many chats reply
    without the reply button, so context matters) and `get_chat_history` (recent messages / a date range).
@@ -60,6 +63,17 @@ MediaArg = Annotated[
     Literal["links", "documents", "photos", "videos", "photos_videos", "voice", "music", "polls", "pinned"] | None,
     Field(description="Only messages of this kind, e.g. 'links' or 'documents' for shared resources, 'pinned' for FAQs"),
 ]
+FollowUpsArg = Annotated[
+    int,
+    Field(
+        description="Also read this many messages written after the question/root WITHOUT a reply link (people "
+        "often answer that way); 0 disables",
+        ge=0, le=50,
+    ),
+]
+FollowWindowArg = Annotated[
+    float, Field(description="How many hours after the question to look for such follow-up messages", gt=0, le=720)
+]
 MaxCharsArg = Annotated[
     int | None, Field(description="Truncate each message text to this many characters (default from server config)", ge=50)
 ]
@@ -69,20 +83,39 @@ def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
-def _render_discussion(i: int, d: Discussion, max_chars: int) -> str:
-    head = f"=== Discussion {i}: [{d.chat.title}] started {fmt_date(d.root.date)}"
-    if d.total_replies is not None:
-        head += f", {d.total_replies} replies in thread"
-    lines = [head, ("» " if d.root.id in d.hit_ids else "") + "ROOT:"]
-    lines.append(format_message(d.root, max_chars, show_chat=False, indent="  "))
-    if d.replies:
-        lines.append(f"REPLIES ({len(d.replies)} shown, » = matched your query):")
-        for r in d.replies:
-            mark = "» " if r.id in d.hit_ids else "  "
-            lines.append(format_message(r, max_chars, show_chat=False, indent=mark))
+def _render_discussion(title: str, d: Discussion, max_chars: int) -> str:
+    """Root, then replies and follow-ups in chronological order.
+
+    (reply) = linked to the conversation by Telegram's reply button; (after) = written after it without a reply link.
+    » marks messages that matched the search.
+    """
+    head = f"=== {title}: [{d.chat.title}] {fmt_date(d.root.date)}"
+    if d.total_replies:
+        head += f", {d.total_replies} reply-linked messages in thread"
+    lines = [head]
+    if d.preceding:
+        lines.append("BEFORE (what the root may be answering):")
+        lines += [format_message(m, max_chars, show_chat=False, indent="  ") for m in d.preceding]
+        lines.append("ROOT:")
+    mark = "» " if d.root.key in d.hit_ids else ""
+    lines.append(format_message(d.root, max_chars, show_chat=False, indent=mark))
+    conv = d.conversation()
+    if conv:
+        n_after = len(d.follow_ups)
+        lines.append(
+            f"CONVERSATION ({len(conv) - n_after} reply-linked, {n_after} written after without a reply link):"
+        )
+        for tag, m in conv:
+            ind = "» " if m.key in d.hit_ids else "  "
+            lines.append(format_message(m, max_chars, show_chat=False, indent=ind, label=tag))
     else:
-        lines.append("(no replies found via reply links — try get_message_context for loose follow-ups)")
+        lines.append("(no replies and no follow-up messages found — widen follow_window_hours or check "
+                     "get_message_context)")
     return "\n".join(lines)
+
+
+def _follow(follow_ups: int, hours: float) -> FollowUp:
+    return FollowUp(limit=follow_ups, window=timedelta(hours=hours))
 
 
 def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer:
@@ -125,6 +158,15 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         except AccessError as e:
             raise ToolError(str(e)) from e
 
+    def check_topic(cs, topic_id):
+        """Topic ids only mean something inside one forum chat."""
+        if topic_id is None:
+            return
+        if len(cs) != 1:
+            raise ToolError("topic_id refers to a topic of one forum chat: pass exactly that chat in `chats`")
+        if not cs[0].forum:
+            raise ToolError(f"{cs[0].title} is not a forum, so it has no topics; drop topic_id")
+
     def chat_or_error(ref):
         try:
             return tg.resolve(ref)
@@ -155,6 +197,7 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         """Keyword search across the allowed chats. Returns matching messages (most query variants matched, then newest
         first) with sender, date, reply info and t.me links. Use search_discussions to get the surrounding threads."""
         cs = chats_or_error(chats)
+        check_topic(cs, topic_id)
         fd, td = dates(from_date, to_date)
         per_chat = _clamp(limit, 10, 100)
         try:
@@ -180,13 +223,17 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         sender: SenderArg = None,
         topic_id: TopicArg = None,
         max_discussions: Annotated[int, Field(description="How many threads to expand", ge=1, le=20)] = 6,
-        max_replies: Annotated[int, Field(description="Max replies per thread", ge=1, le=200)] = 40,
+        max_replies: Annotated[int, Field(description="Max reply-linked messages per thread", ge=1, le=200)] = 40,
+        follow_ups: FollowUpsArg = 10,
+        follow_window_hours: FollowWindowArg = 24,
         max_chars: MaxCharsArg = None,
     ) -> str:
-        """Find discussions about a topic: searches the keywords, then expands each hit into its whole thread
-        (the original question/post, the reply chain and the answers). Best tool for "what did people say / how was
-        X solved" questions."""
+        """Find discussions about a topic: searches the keywords, then expands each hit into its whole conversation —
+        the original question/post, reply-linked answers and the messages written after it without the reply button
+        (and, if the hit is a loose answer, the messages just before it). Best tool for "what did people say / how
+        was X solved" questions."""
         cs = chats_or_error(chats)
+        check_topic(cs, topic_id)
         fd, td = dates(from_date, to_date)
         try:
             hits, errs = await tg.search(
@@ -198,12 +245,12 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         if not hits:
             msg = f"No messages found for {queries!r}. Try other keywords/stems/synonyms or a wider date range."
             return msg + ("\nErrors: " + "; ".join(errs) if errs else "")
-        ds = await tg.discussions(hits, max_discussions, max_replies)
+        ds = await tg.discussions(hits, max_discussions, max_replies, _follow(follow_ups, follow_window_hours))
         mc = chars(max_chars) if max_chars else min(default_chars, 800)
         parts = [f"{len(ds)} discussion(s) for {queries!r} ({len(hits)} matching messages)."]
         if errs:
             parts.append("Errors: " + "; ".join(errs))
-        parts += [_render_discussion(i, d, mc) for i, d in enumerate(ds, 1)]
+        parts += [_render_discussion(f"Discussion {i}", d, mc) for i, d in enumerate(ds, 1)]
         return "\n\n".join(parts)
 
     @tool
@@ -216,24 +263,34 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         from_date: FromArg = None,
         to_date: ToArg = None,
         topic_id: TopicArg = None,
-        include_answers: Annotated[bool, Field(description="Attach the replies each question received")] = True,
-        unanswered_only: Annotated[bool, Field(description="Only questions nobody else replied to")] = False,
+        include_answers: Annotated[
+            bool, Field(description="Attach the replies and the messages written after each question")
+        ] = True,
+        unanswered_only: Annotated[
+            bool,
+            Field(description="Only questions with no reply and no follow-up message from anyone else within "
+                  "follow_window_hours (in busy chats unrelated chatter also counts, so this is conservative)"),
+        ] = False,
         limit: Annotated[int, Field(description="Max questions to return", ge=1, le=50)] = 15,
-        max_answers: Annotated[int, Field(description="Max replies per question", ge=1, le=100)] = 15,
+        max_answers: Annotated[int, Field(description="Max reply-linked answers per question", ge=1, le=100)] = 15,
+        follow_ups: FollowUpsArg = 8,
+        follow_window_hours: FollowWindowArg = 24,
         scan_per_chat: Annotated[
             int, Field(description="How many matching/recent messages to scan per chat and query", ge=20, le=1000)
         ] = 200,
         max_chars: MaxCharsArg = None,
     ) -> str:
         """Find questions people asked in the chats (messages with '?' or starting with how/why/подскажите/etc.),
-        optionally about given keywords, with the answers they got. Good for FAQs, common problems and open issues."""
+        optionally about given keywords, with the answers they got — both reply-linked and messages written right
+        after the question. Good for FAQs, common problems and open issues."""
         cs = chats_or_error(chats)
+        check_topic(cs, topic_id)
         fd, td = dates(from_date, to_date)
         try:
             found = await tg.questions(
                 cs, queries or [], limit=limit, scan_per_chat=scan_per_chat,
                 include_answers=include_answers, max_answers=max_answers, unanswered_only=unanswered_only,
-                from_date=fd, to_date=td, topic_id=topic_id,
+                fu=_follow(follow_ups, follow_window_hours), from_date=fd, to_date=td, topic_id=topic_id,
             )
         except ValueError as e:
             raise ToolError(str(e)) from e
@@ -241,15 +298,11 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
             return "No questions found. Try other keywords, a wider date range or a larger scan_per_chat."
         mc = chars(max_chars) if max_chars else min(default_chars, 800)
         parts = [f"{len(found)} question(s):"]
-        for i, (q, answers) in enumerate(found, 1):
-            block = [f"=== Q{i}", format_message(q, mc)]
-            if answers is not None:
-                if answers:
-                    block.append(f"ANSWERS ({len(answers)}):")
-                    block += [format_message(a, mc, show_chat=False, indent="  ") for a in answers]
-                else:
-                    block.append("(no replies via reply links — check get_message_context for loose answers)")
-            parts.append("\n".join(block))
+        for i, d in enumerate(found, 1):
+            if include_answers:
+                parts.append(_render_discussion(f"Q{i}", d, mc))
+            else:
+                parts.append(f"=== Q{i}\n" + format_message(d.root, mc))
         return "\n\n".join(parts)
 
     @tool
@@ -273,6 +326,7 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         """Read messages of one chat without a search query: the latest messages, a date range, one forum topic or
         one sender. Use it for "what's new / what was discussed last week" and to page through history."""
         c = chat_or_error(chat)
+        check_topic([c], topic_id)
         fd, td = dates(from_date, to_date)
         try:
             msgs = await tg.fetch(
@@ -322,19 +376,22 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         chat: ChatArg,
         message_id: int,
         max_replies: Annotated[int, Field(ge=1, le=300)] = 100,
+        follow_ups: FollowUpsArg = 15,
+        follow_window_hours: FollowWindowArg = 24,
         max_chars: MaxCharsArg = None,
     ) -> str:
-        """Get the full reply thread a message belongs to: the chain of messages it replies to up to the root, and
-        all replies to the root. For channel posts this returns the comments."""
+        """Get the whole conversation a message belongs to: the chain of messages it replies to up to the root, all
+        replies to the root, and the messages written after the root without a reply link. For channel posts this
+        returns the comments."""
         c = chat_or_error(chat)
         try:
             got = await tg.get_by_ids(c, [message_id])
             if not got:
                 raise ToolError(f"Message #{message_id} not found in {c.title}.")
-            d = await tg.discussion_for(c, got[0], max_replies)
+            d = await tg.discussion_for(c, got[0], max_replies, _follow(follow_ups, follow_window_hours))
         except AccessError as e:
             raise ToolError(str(e)) from e
-        return _render_discussion(1, d, chars(max_chars)).replace("=== Discussion 1:", "=== Thread:", 1)
+        return _render_discussion("Thread", d, chars(max_chars))
 
     @tool
     async def get_messages(

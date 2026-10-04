@@ -76,3 +76,10 @@ def test_invalid_session_message():
 def test_proxy():
     cfg = load_config({**BASE_ENV, "TG_PROXY": "socks5://u:p@127.0.0.1:1080"})
     assert cfg.proxy == ("socks5", "127.0.0.1", 1080, True, "u", "p")
+
+
+def test_bad_numbers_and_log_level_are_config_errors():
+    with pytest.raises(ConfigError, match="PORT"):
+        load_config({**BASE_ENV, "PORT": "abc"})
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        load_config({**BASE_ENV, "LOG_LEVEL": "verbose"})

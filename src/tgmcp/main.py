@@ -19,6 +19,8 @@ def build_http_app(mcp, config, tg: TelegramService):
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 
+    from mcp.server.transport_security import TransportSecuritySettings
+
     from .auth import TokenAuthMiddleware
 
     @mcp.custom_route("/health", methods=["GET"])
@@ -35,7 +37,14 @@ def build_http_app(mcp, config, tg: TelegramService):
         )
 
     # Stateless + JSON responses: survives restarts and plays well with reverse proxies.
-    app = mcp.streamable_http_app(stateless_http=True, json_response=True, host=config.host)
+    # The SDK enables DNS-rebinding protection for 127.0.0.1 and then rejects requests forwarded by a reverse proxy
+    # (Host: your.domain). The endpoint is protected by MCP_AUTH_TOKEN instead, which rebinding can't obtain.
+    app = mcp.streamable_http_app(
+        stateless_http=True,
+        json_response=True,
+        host=config.host,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
     if config.auth_token:
         app = TokenAuthMiddleware(app, config.auth_token)
     else:

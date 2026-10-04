@@ -53,7 +53,7 @@ class FakeClient:
         return rt.reply_to_top_id or rt.reply_to_msg_id
 
     def iter_messages(self, entity, limit=None, *, search=None, offset_id=0, min_id=0, reverse=False,
-                      reply_to=None, offset_date=None, from_user=None, filter=None, **_):
+                      reply_to=None, offset_date=None, from_user=None, filter=None, max_id=0, **_):
         items = list(self.messages)
         if reply_to is not None:
             if not self.supports_replies:
@@ -65,6 +65,8 @@ class FakeClient:
             items = [m for m in items if m.id < offset_id]
         if min_id:
             items = [m for m in items if m.id > min_id]
+        if max_id:
+            items = [m for m in items if m.id < max_id]
         if offset_date and not reverse:
             items = [m for m in items if m.date < offset_date]
         if offset_date and reverse:

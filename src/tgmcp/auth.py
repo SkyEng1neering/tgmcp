@@ -22,7 +22,7 @@ class TokenAuthMiddleware:
         self._prefix = f"/{token}"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
         path: str = scope.get("path", "")
@@ -40,6 +40,9 @@ class TokenAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
         if path.startswith("/.well-known/"):
             # No OAuth here: a 404 tells MCP clients probing for OAuth metadata to stop instead of
             # starting an authorization flow that cannot succeed.

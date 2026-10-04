@@ -31,6 +31,7 @@ MEDIA_FILTERS = {
 
 _MAX_ANCESTOR_DEPTH = 15
 _SCAN_LIMIT = 2000  # messages scanned to rebuild reply trees where Telegram has no threads
+_MAX_SCAN = 3000  # Telethon throttles iterations with limit > 3000 (1s per 100 messages)
 
 
 class AccessError(Exception):
@@ -62,9 +63,36 @@ def parse_when(value: str | None, *, end_of_day: bool = False) -> datetime | Non
 class Discussion:
     chat: ChatInfo
     root: MsgView
-    replies: list[MsgView] = field(default_factory=list)
-    hit_ids: set[int] = field(default_factory=set)
+    replies: list[MsgView] = field(default_factory=list)  # linked to the root by reply chains
+    follow_ups: list[MsgView] = field(default_factory=list)  # written after the root without a reply link
+    preceding: list[MsgView] = field(default_factory=list)  # just before a root that isn't a question
+    hit_ids: set[tuple[int, int]] = field(default_factory=set)  # MsgView.key: comments live in another chat
     total_replies: int | None = None
+
+    def conversation(self) -> list[tuple[str, MsgView]]:
+        """Replies and follow-ups merged chronologically, each tagged 'reply' or 'after'."""
+        tagged = [("reply", m) for m in self.replies] + [("after", m) for m in self.follow_ups]
+        return sorted(tagged, key=lambda t: t[1].id)
+
+    def answers_by_others(self) -> list[MsgView]:
+        return [m for _, m in self.conversation() if m.sender_id is None or m.sender_id != self.root.sender_id]
+
+
+@dataclass(frozen=True)
+class FollowUp:
+    """How far to read on after a message, for answers posted without the reply button."""
+
+    limit: int = 10
+    window: timedelta = timedelta(hours=24)
+    preceding: int = 3
+
+    @classmethod
+    def off(cls) -> FollowUp:
+        return cls(limit=0, preceding=0)
+
+
+def _keys(d: Discussion) -> set[tuple[int, int]]:
+    return {d.root.key, *(m.key for m in d.replies), *(m.key for m in d.follow_ups)}
 
 
 class TelegramService:
@@ -289,16 +317,15 @@ class TelegramService:
         rt = msg.reply_to
         if not isinstance(rt, types.MessageReplyHeader):
             return None, (1 if forum else None)
-        if rt.reply_to_peer_id is not None and utils.get_peer_id(rt.reply_to_peer_id) != msg.chat_id:
-            # A quote of a message from another chat: its id means nothing here.
-            return None, (1 if forum else None)
         if forum and rt.forum_topic:
-            if rt.reply_to_top_id:
-                return rt.reply_to_msg_id, rt.reply_to_top_id
-            return None, rt.reply_to_msg_id
-        if forum:
-            return rt.reply_to_msg_id, 1
-        return rt.reply_to_msg_id, None
+            reply_to, topic = (rt.reply_to_msg_id, rt.reply_to_top_id) if rt.reply_to_top_id else (None, rt.reply_to_msg_id)
+        elif forum:
+            reply_to, topic = rt.reply_to_msg_id, 1
+        else:
+            reply_to, topic = rt.reply_to_msg_id, None
+        if rt.reply_to_peer_id is not None and utils.get_peer_id(rt.reply_to_peer_id) != msg.chat_id:
+            reply_to = None  # a quote of a message from another chat: its id means nothing here
+        return reply_to, topic
 
     @staticmethod
     def _rpc_error(chat: ChatInfo, e: Exception) -> AccessError:
@@ -338,6 +365,7 @@ class TelegramService:
             edited=bool(getattr(msg, "edit_date", None)) and not getattr(msg, "edit_hide", False),
             reactions=reactions,
             sender_id=msg.sender_id,
+            service=service,
         )
 
     # --- primitive reads -----------------------------------------------------
@@ -390,9 +418,11 @@ class TelegramService:
             else:
                 reply_to = topic_id
         # Client-side filtering needs to look at more messages than it returns.
-        scan_cap = limit if name_filter is None and topic_filter is None else max(limit * 20, 1000)
+        # Kept <= 3000: above that Telethon sleeps 1s between pages while we hold the request semaphore.
+        scan_cap = limit if name_filter is None and topic_filter is None else min(max(limit * 20, 1000), _MAX_SCAN)
         kwargs = dict(
-            limit=scan_cap,  # finite: with limit=None Telethon sleeps 1s between chunks
+            limit=scan_cap,
+            wait_time=0,
             search=query or None,
             filter=flt,
             from_user=from_user,
@@ -401,6 +431,9 @@ class TelegramService:
             reverse=reverse,
             reply_to=reply_to,
         )
+        if reverse and offset_id:
+            # In reverse mode Telethon treats offset_id as a lower bound; "older than X" is max_id there.
+            kwargs["offset_id"], kwargs["max_id"] = 0, offset_id
         out: list[MsgView] = []
         async with self._sem:
             try:
@@ -473,10 +506,13 @@ class TelegramService:
                     res = [self.to_view(m, chat) async for m in it]
                     total = getattr(it, "total", None)
                 return res, total
-            except errors.RPCError as e:
+            except errors.MsgIdInvalidError as e:
+                # The message has no reply thread (e.g. a post without comments).
                 if chat.kind == "channel":
-                    return [], 0  # a broadcast post without comments
+                    return [], 0
                 log.debug("GetReplies failed for %s/%s (%s), falling back to scan", chat.title, msg_id, e)
+            except errors.RPCError as e:
+                raise self._rpc_error(chat, e) from e  # flood waits etc. must not be cached as "no replies"
         try:
             return await self._replies_by_scan(chat, msg_id, limit)
         except errors.RPCError as e:
@@ -544,35 +580,112 @@ class TelegramService:
         ordered = sorted(merged.values(), key=lambda m: (hits[m.key], m.date), reverse=True)
         return ordered[:limit], sorted(set(errors_))
 
-    async def discussion_for(self, chat: ChatInfo, hit: MsgView, max_replies: int) -> Discussion:
-        """Expand a single message into its full discussion: root, chain to the hit and the replies."""
+    async def follow_ups(self, chat: ChatInfo, root: MsgView, thread: set[int], fu: FollowUp) -> list[MsgView]:
+        """Messages written after `root` without a reply link — people often answer that way.
+
+        Reads forward (inside the same forum topic) for up to `fu.window`, skipping messages that reply to something
+        outside the conversation, since those belong to other discussions. Replies to accepted follow-ups are kept.
+        `thread` holds the ids already in the conversation and is extended in place.
+        """
+        if fu.limit <= 0 or chat.kind == "channel":  # consecutive channel posts aren't answers
+            return []
+        msgs = await self.fetch(
+            chat, min_id=root.id, reverse=True, limit=fu.limit * 3, to_date=root.date + fu.window,
+            topic_id=root.topic_id if chat.forum else None,
+        )
+        out: list[MsgView] = []
+        for m in msgs:
+            if m.id in thread or m.service:
+                continue
+            if m.reply_to_id and m.reply_to_id not in thread:
+                continue
+            thread.add(m.id)
+            out.append(m)
+            if len(out) >= fu.limit:
+                break
+        return out
+
+    async def preceding(self, chat: ChatInfo, msg: MsgView, fu: FollowUp) -> list[MsgView]:
+        """A few messages right before `msg` (same topic), oldest first: the question a loose answer refers to."""
+        if fu.preceding <= 0 or chat.kind == "channel":
+            return []
+        msgs = await self.fetch(
+            chat, offset_id=msg.id, limit=fu.preceding, from_date=msg.date - fu.window,
+            topic_id=msg.topic_id if chat.forum else None,
+        )
+        return [m for m in reversed(msgs) if not m.service]
+
+    async def expand(
+        self,
+        chat: ChatInfo,
+        root: MsgView,
+        max_replies: int,
+        fu: FollowUp,
+        *,
+        known_replies: int | None = None,
+        linked: list[MsgView] = (),
+    ) -> Discussion:
+        """Root plus everything that answers it: reply-linked messages and loose follow-ups.
+
+        `linked` are messages already known to belong to the thread (e.g. the chain down to a search hit).
+        """
+        if known_replies == 0:
+            replies, total = [], 0  # Telegram already told us nobody replied
+        else:
+            replies, total = await self.replies(chat, root.id, max_replies)
+        have = {m.key for m in replies}
+        replies = sorted(replies + [m for m in linked if m.key not in have and m.id != root.id], key=lambda m: m.id)
+        thread = {root.id, *(m.id for m in replies if m.chat.id == root.chat.id)}
+        found = await self.follow_ups(chat, root, thread, fu)
+        # Messages found by reading on that do carry a reply link (e.g. beyond a truncated replies listing)
+        # are reply-linked, not loose.
+        replies = sorted(replies + [m for m in found if m.reply_to_id], key=lambda m: m.id)
+        follow = [m for m in found if not m.reply_to_id]
+        return Discussion(chat=chat, root=root, replies=replies, follow_ups=follow, total_replies=total)
+
+    async def discussion_for(self, chat: ChatInfo, hit: MsgView, max_replies: int, fu: FollowUp) -> Discussion:
+        """Expand a single message into its full discussion: root, chain to the hit, replies and follow-ups."""
         chain = await self.ancestors(chat, hit)
         root = chain[0] if chain else hit
-        replies, total = await self.replies(chat, root.id, max_replies)
-        known = {m.id for m in replies}
-        # Make sure the chain and hit are present even if the replies listing was truncated.
-        extra = [m for m in chain[1:] + ([hit] if hit.id != root.id else []) if m.id not in known]
-        replies = sorted(replies + extra, key=lambda m: m.id)
-        return Discussion(chat=chat, root=root, replies=replies, hit_ids={hit.id}, total_replies=total)
+        d = await self.expand(chat, root, max_replies, fu, linked=chain[1:] + [hit])
+        if not chain and not looks_like_question(root.text):
+            # The root may itself be a loose answer; show what it was answering.
+            d.preceding = await self.preceding(chat, root, fu)
+        d.hit_ids = {hit.key}
+        return d
 
-    async def discussions(self, hits: list[MsgView], max_discussions: int, max_replies: int) -> list[Discussion]:
+    async def discussions(
+        self, hits: list[MsgView], max_discussions: int, max_replies: int, fu: FollowUp
+    ) -> list[Discussion]:
         out: dict[tuple[int, int], Discussion] = {}
-        for hit in hits:
-            if len(out) >= max_discussions:
-                break
-            chat = self.chats.get(hit.chat.id)
-            if chat is None:
-                continue
+        pending = [h for h in hits if h.chat.id in self.chats]
+
+        async def expand_hit(hit: MsgView) -> Discussion | None:
             try:
-                d = await self.discussion_for(chat, hit, max_replies)
+                return await self.discussion_for(self.chats[hit.chat.id], hit, max_replies, fu)
             except AccessError as e:
                 log.debug("discussion expansion failed: %s", e)
-                continue
-            key = (chat.id, d.root.id)
-            if key in out:
-                out[key].hit_ids.add(hit.id)
-            else:
-                out[key] = d
+                return None
+
+        # Expand in parallel batches (Telegram concurrency is still bounded by the semaphore), keeping hit order.
+        while pending and len(out) < max_discussions:
+            batch = []
+            while pending and len(batch) < max_discussions - len(out):
+                hit = pending.pop(0)
+                # A hit already shown inside an earlier discussion just gets marked there.
+                seen = next((d for d in out.values() if hit.key in _keys(d)), None)
+                if seen:
+                    seen.hit_ids.add(hit.key)
+                else:
+                    batch.append(hit)
+            for hit, d in zip(batch, await asyncio.gather(*(expand_hit(h) for h in batch))):
+                if d is None:
+                    continue
+                key = (d.chat.id, d.root.id)
+                if key in out:
+                    out[key].hit_ids.add(hit.key)
+                elif len(out) < max_discussions:
+                    out[key] = d
         return list(out.values())
 
     async def questions(
@@ -585,36 +698,40 @@ class TelegramService:
         include_answers: bool,
         max_answers: int,
         unanswered_only: bool,
+        fu: FollowUp,
         **filters,
-    ) -> list[tuple[MsgView, list[MsgView] | None]]:
+    ) -> list[Discussion]:
+        """Questions (newest first) expanded with their reply-linked answers and the messages written after them."""
         candidates, _ = await self.search(chats, queries, limit=10_000, per_chat_limit=scan_per_chat, **filters)
         qs = [m for m in candidates if looks_like_question(m.text)]
         qs.sort(key=lambda m: m.date, reverse=True)
-        result: list[tuple[MsgView, list[MsgView] | None]] = []
-        lookups = 0
-        for q in qs:
-            if len(result) >= limit or lookups >= limit * 5:
-                break
-            answers = None
-            if include_answers or unanswered_only:
-                chat = self.chats.get(q.chat.id)
-                if chat is None:
+        qs = [q for q in qs if q.chat.id in self.chats]
+        if not (include_answers or unanswered_only):
+            return [Discussion(chat=self.chats[q.chat.id], root=q) for q in qs[:limit]]
+
+        async def expand_q(q: MsgView) -> Discussion | None:
+            try:
+                return await self.expand(self.chats[q.chat.id], q, max_answers, fu, known_replies=q.replies)
+            except AccessError as e:
+                log.debug("answers lookup failed: %s", e)
+                return None
+
+        result: list[Discussion] = []
+        checked = 0
+        # Parallel batches, newest questions first; cap lookups so unanswered_only can't scan forever.
+        while qs and len(result) < limit and checked < limit * 5:
+            batch, qs = qs[: limit - len(result)], qs[limit - len(result):]
+            checked += len(batch)
+            for d in await asyncio.gather(*(expand_q(q) for q in batch)):
+                if d is None:
                     continue
-                if q.replies == 0:
-                    answers = []  # Telegram already told us nobody replied
-                else:
-                    lookups += 1
-                    try:
-                        answers, _ = await self.replies(chat, q.id, max_answers)
-                    except AccessError as e:
-                        log.debug("replies lookup failed: %s", e)
-                        answers = []
-                # Replies from the asker themself are follow-ups, not answers.
-                answers_by_others = [a for a in answers if a.sender_id is None or a.sender_id != q.sender_id]
-                if unanswered_only and answers_by_others:
+                # Messages from the asker themself are follow-ups, not answers.
+                if unanswered_only and d.answers_by_others():
                     continue
-            result.append((q, answers if include_answers else None))
-        return result
+                if not include_answers:
+                    d.replies, d.follow_ups = [], []
+                result.append(d)
+        return result[:limit]
 
     async def topics(self, chat: ChatInfo, query: str | None, limit: int) -> list[dict]:
         if not chat.forum:

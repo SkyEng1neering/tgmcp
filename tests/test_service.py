@@ -3,12 +3,13 @@ import asyncio
 import pytest
 
 from fakes import CHANNEL_ID, make_service, msg
-from tgmcp.telegram import AccessError
+from tgmcp.telegram import AccessError, FollowUp
 
 def by(m, user_id):
     from telethon import types
 
     m.from_id = types.PeerUser(user_id)
+    m._sender_id = user_id  # Telethon derives sender_id in the constructor
     return m
 
 
@@ -55,10 +56,11 @@ def test_context_is_chronological(svc):
 def test_discussion_expands_hit_to_root_and_replies(svc):
     chat = next(iter(svc.chats.values()))
     hit = run(svc.get_by_ids(chat, [4]))[0]
-    d = run(svc.discussion_for(chat, hit, 50))
+    d = run(svc.discussion_for(chat, hit, 50, FollowUp.off()))
     assert d.root.id == 2
     assert [r.id for r in d.replies] == [3, 4]
-    assert d.hit_ids == {4}
+    assert d.hit_ids == {hit.key}
+    assert d.follow_ups == [] and d.preceding == []
 
 
 def test_replies_fallback_scan_for_groups_without_threads():
@@ -71,11 +73,11 @@ def test_replies_fallback_scan_for_groups_without_threads():
 def test_questions_with_answers_and_unanswered(svc):
     chats = list(svc.chats.values())
     found = run(svc.questions(chats, [], limit=10, scan_per_chat=100, include_answers=True, max_answers=10,
-                              unanswered_only=False))
-    assert {q.id: [a.id for a in ans] for q, ans in found} == {2: [3, 4], 5: []}
+                              unanswered_only=False, fu=FollowUp.off()))
+    assert {d.root.id: [a.id for a in d.replies] for d in found} == {2: [3, 4], 5: []}
     open_qs = run(svc.questions(chats, [], limit=10, scan_per_chat=100, include_answers=False, max_answers=10,
-                                unanswered_only=True))
-    assert [q.id for q, _ in open_qs] == [5]
+                                unanswered_only=True, fu=FollowUp.off()))
+    assert [d.root.id for d in open_qs] == [5]
 
 
 def test_cache_reuses_identical_reads(svc):
@@ -164,3 +166,87 @@ def test_forum_context_stays_in_topic():
     chat = next(iter(svc.chats.values()))
     ids = [m.id for m in run(svc.context(chat, 13, before=2, after=2))]
     assert ids == [9, 11, 13, 15, 17]
+
+
+# People often answer without the reply button: the conversation must include what was written after.
+LOOSE = [
+    by(msg(1, "Как настроить nginx для websocket?"), 100),
+    by(msg(2, "Нужен proxy_set_header Upgrade"), 200),  # answer without reply
+    by(msg(3, "а вот про докер", reply_to=99), 300),  # reply into another conversation
+    by(msg(4, "спасибо, помогло", reply_to=2), 100),  # reply to the loose answer
+    by(msg(5, "сильно позже", minutes=60 * 30), 200),  # outside the 24h window
+]
+
+
+def test_question_gets_loose_answers_after_it():
+    svc = make_service(LOOSE)
+    chats = list(svc.chats.values())
+    [d] = run(svc.questions(chats, [], limit=10, scan_per_chat=100, include_answers=True, max_answers=10,
+                            unanswered_only=False, fu=FollowUp()))
+    assert d.root.id == 1
+    # #2 was written after the question without a reply link; #4 replies to #2, so it is reply-linked
+    assert [m.id for m in d.follow_ups] == [2]
+    assert [(tag, m.id) for tag, m in d.conversation()] == [("after", 2), ("reply", 4)]
+
+
+def test_loose_answer_hit_shows_the_question_before_it():
+    svc = make_service(LOOSE)
+    chat = next(iter(svc.chats.values()))
+    hit = run(svc.get_by_ids(chat, [2]))[0]
+    d = run(svc.discussion_for(chat, hit, 50, FollowUp()))
+    assert [m.id for m in d.preceding] == [1]
+    assert [(tag, m.id) for tag, m in d.conversation()] == [("reply", 4)]
+
+
+def test_unanswered_ignores_askers_own_follow_ups():
+    svc = make_service([by(msg(1, "Как починить сборку?"), 100), by(msg(2, "ап, всё ещё актуально"), 100)])
+    chats = list(svc.chats.values())
+    open_qs = run(svc.questions(chats, [], limit=10, scan_per_chat=100, include_answers=True, max_answers=10,
+                                unanswered_only=True, fu=FollowUp()))
+    assert [d.root.id for d in open_qs] == [1]
+    svc = make_service(LOOSE)
+    open_qs = run(svc.questions(list(svc.chats.values()), [], limit=10, scan_per_chat=100, include_answers=True,
+                                max_answers=10, unanswered_only=True, fu=FollowUp()))
+    assert open_qs == []
+
+
+def test_reply_beyond_truncated_listing_is_labelled_reply():
+    svc = make_service(THREAD)
+    chat = next(iter(svc.chats.values()))
+    q = run(svc.get_by_ids(chat, [2]))[0]
+    d = run(svc.expand(chat, q, max_replies=1, fu=FollowUp()))
+    tags = dict((m.id, tag) for tag, m in d.conversation())
+    assert tags[3] == "reply" and tags[4] == "reply" and tags[5] == "after"
+
+
+def test_oldest_first_before_message_id_is_upper_bound(svc):
+    chat = next(iter(svc.chats.values()))
+    got = run(svc.fetch(chat, offset_id=4, reverse=True, limit=10))
+    assert [m.id for m in got] == [1, 2, 3]
+
+
+def test_cross_chat_quote_keeps_forum_topic():
+    from telethon import types
+
+    svc = make_service([], forum=True)
+    chat = next(iter(svc.chats.values()))
+    m = msg(30, "quote in topic")
+    m.reply_to = types.MessageReplyHeader(reply_to_msg_id=5, reply_to_top_id=7, forum_topic=True,
+                                          reply_to_peer_id=types.PeerChannel(999))
+    v = svc.to_view(m, chat)
+    assert (v.reply_to_id, v.topic_id) == (None, 7)
+
+
+def test_flood_wait_on_channel_post_is_not_cached_as_no_comments():
+    from telethon import errors
+
+    svc = make_service(THREAD, kind="channel")
+    chat = next(iter(svc.chats.values()))
+
+    def boom(*a, **kw):
+        raise errors.FloodWaitError(request=None, capture=120)
+
+    svc.client.iter_messages = boom
+    with pytest.raises(AccessError, match="FloodWait"):
+        run(svc.replies(chat, 2, 10))
+    assert svc.cache._data == {}
