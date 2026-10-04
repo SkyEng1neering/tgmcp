@@ -1,0 +1,9 @@
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy tgmcp:8000 {
+		# MCP responses can take a while when calls are queued or Telegram asks us to slow down
+		transport http {
+			read_timeout 5m
+		}
+	}
+}

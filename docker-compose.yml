@@ -1,0 +1,39 @@
+services:
+  tgmcp:
+    build: .
+    image: tgmcp:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+    # Only reachable from this host by default; the public HTTPS entry point is Caddy below
+    # (or your own reverse proxy). Change to "8000:8000" to expose plain HTTP — not recommended.
+    ports:
+      - "127.0.0.1:${TGMCP_LOCAL_PORT:-8000}:8000"
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Automatic HTTPS (Let's Encrypt). Enable with: docker compose --profile https up -d
+  # Needs DOMAIN in .env pointing (DNS A record) to this server and ports 80/443 open.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on: [tgmcp]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
