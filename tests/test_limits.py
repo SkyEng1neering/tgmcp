@@ -73,3 +73,22 @@ def test_cache_single_flight_and_errors_not_cached():
         assert "e" not in cache._data
 
     asyncio.run(go())
+
+
+def test_cache_caller_cancellation_does_not_break_other_waiters():
+    async def go():
+        cache = TTLCache(ttl=60)
+
+        async def slow():
+            await asyncio.sleep(0.05)
+            return "v"
+
+        first = asyncio.create_task(cache.get("k", slow))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(cache.get("k", slow))
+        await asyncio.sleep(0.01)
+        first.cancel()
+        assert await second == "v"
+        assert await cache.get("k", slow) == "v" and cache.misses == 1
+
+    asyncio.run(go())

@@ -56,44 +56,46 @@ class CallGate:
 
 
 class TTLCache:
-    """Async memoiser: fresh results are reused for `ttl` seconds and concurrent identical calls share one request."""
+    """Async memoiser: fresh results are reused for `ttl` seconds and concurrent identical calls share one request.
 
-    def __init__(self, ttl: float, max_entries: int = 2000):
+    The shared request runs as its own task, so a caller that disconnects (and gets cancelled) neither cancels the
+    work for the other waiters nor loses the result for the cache.
+    """
+
+    def __init__(self, ttl: float, max_entries: int = 500):
         self.ttl = ttl
         self.max_entries = max_entries
         self._data: OrderedDict[Hashable, tuple[float, Any]] = OrderedDict()
-        self._inflight: dict[Hashable, asyncio.Future] = {}
+        self._inflight: dict[Hashable, asyncio.Task] = {}
         self.hits = 0
         self.misses = 0
 
     async def get(self, key: Hashable, factory: Callable[[], Awaitable[Any]]) -> Any:
         if self.ttl <= 0:
             return await factory()
-        now = time.monotonic()
         item = self._data.get(key)
-        if item and item[0] > now:
+        if item and item[0] > time.monotonic():
             self._data.move_to_end(key)
             self.hits += 1
             return item[1]
-        if key in self._inflight:
+        task = self._inflight.get(key)
+        if task is None:
+            self.misses += 1
+            task = asyncio.ensure_future(self._run(key, factory))
+            # If every waiter was cancelled, still consume the outcome so asyncio doesn't log it as lost.
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            self._inflight[key] = task
+        else:
             self.hits += 1
-            return await asyncio.shield(self._inflight[key])
-        self.misses += 1
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._inflight[key] = fut
+        return await asyncio.shield(task)
+
+    async def _run(self, key: Hashable, factory: Callable[[], Awaitable[Any]]) -> Any:
         try:
             value = await factory()
-        except BaseException as e:
-            if not fut.done():
-                fut.set_exception(e)
-                fut.exception()  # mark retrieved so lone failures don't log "never retrieved"
-            raise
-        else:
-            fut.set_result(value)
-            self._data[key] = (time.monotonic() + self.ttl, value)
-            self._data.move_to_end(key)
-            while len(self._data) > self.max_entries:
-                self._data.popitem(last=False)
-            return value
         finally:
             self._inflight.pop(key, None)
+        self._data[key] = (time.monotonic() + self.ttl, value)
+        self._data.move_to_end(key)
+        while len(self._data) > self.max_entries:
+            self._data.popitem(last=False)
+        return value

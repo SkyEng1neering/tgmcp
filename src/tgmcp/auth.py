@@ -40,18 +40,18 @@ class TokenAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        body = json.dumps({"error": "unauthorized"}).encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                    (b"www-authenticate", b'Bearer realm="tgmcp"'),
-                ],
-            }
-        )
+        if path.startswith("/.well-known/"):
+            # No OAuth here: a 404 tells MCP clients probing for OAuth metadata to stop instead of
+            # starting an authorization flow that cannot succeed.
+            await self._reply(send, 404, {"error": "not_found"})
+            return
+        await self._reply(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", b'Bearer realm="tgmcp"')])
+
+    @staticmethod
+    async def _reply(send: Send, status: int, payload: dict, extra_headers: list | None = None) -> None:
+        body = json.dumps(payload).encode()
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+        await send({"type": "http.response.start", "status": status, "headers": headers + (extra_headers or [])})
         await send({"type": "http.response.body", "body": body})
 
     def _path_ok(self, path: str) -> bool:

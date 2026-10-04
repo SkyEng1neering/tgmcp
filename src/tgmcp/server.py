@@ -49,7 +49,7 @@ QueriesArg = Annotated[
     ),
 ]
 FromArg = Annotated[
-    str | None, Field(description="Only messages after this: YYYY-MM-DD, ISO datetime, or relative (12h, 7d, 2w, 3m, 1y)")
+    str | None, Field(description="Only messages after this: YYYY-MM-DD, ISO datetime, or relative (12h, 7d, 2w, 3m = 3 months, 1y)")
 ]
 ToArg = Annotated[str | None, Field(description="Only messages before this: YYYY-MM-DD (inclusive) or ISO datetime")]
 SenderArg = Annotated[
@@ -264,6 +264,9 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         before_message_id: Annotated[
             int | None, Field(description="Paging: only messages older than this id (newest-first mode)")
         ] = None,
+        after_message_id: Annotated[
+            int | None, Field(description="Paging: only messages newer than this id (use with oldest_first)")
+        ] = None,
         limit: Annotated[int, Field(ge=1, le=300)] = 50,
         max_chars: MaxCharsArg = None,
     ) -> str:
@@ -274,7 +277,7 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         try:
             msgs = await tg.fetch(
                 c, limit=limit, from_date=fd, to_date=td, sender=sender, topic_id=topic_id, media=media,
-                offset_id=before_message_id or 0, reverse=oldest_first,
+                offset_id=before_message_id or 0, min_id=after_message_id or 0, reverse=oldest_first,
             )
         except (AccessError, ValueError) as e:
             raise ToolError(str(e)) from e
@@ -284,8 +287,10 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
             return f"No messages in {c.title} for these filters."
         tail = ""
         if len(msgs) >= limit:
-            nxt = msgs[0].id if not oldest_first else None
-            tail = f"\n\n(limit reached; for older messages call again with before_message_id={nxt})" if nxt else ""
+            if oldest_first:
+                tail = f"\n\n(limit reached; for newer messages call again with after_message_id={msgs[-1].id})"
+            else:
+                tail = f"\n\n(limit reached; for older messages call again with before_message_id={msgs[0].id})"
         return f"{len(msgs)} messages from {c.title}, oldest first:\n\n" + format_messages(
             msgs, chars(max_chars), show_chat=False
         ) + tail

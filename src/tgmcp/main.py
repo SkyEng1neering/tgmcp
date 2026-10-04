@@ -129,7 +129,7 @@ def main() -> None:
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(2)
     transport = args.transport or config.transport
-    if transport == "http" and not config.auth_token and not config.allow_no_auth:
+    if transport == "http" and not args.check and not config.auth_token and not config.allow_no_auth:
         print("Configuration error: MCP_AUTH_TOKEN is required for the http transport", file=sys.stderr)
         sys.exit(2)
 

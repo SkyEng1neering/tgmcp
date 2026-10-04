@@ -123,3 +123,44 @@ def test_search_inside_forum_topic_keeps_query():
     assert [m.id for m in found] == [10]
     browsed = run(svc.fetch(chat, topic_id=7, limit=10))
     assert {m.id for m in browsed} == {10, 11}
+
+
+def test_oldest_first_from_date_uses_id_bound(svc):
+    from datetime import timedelta
+
+    from fakes import BASE
+
+    chat = next(iter(svc.chats.values()))
+    got = run(svc.fetch(chat, from_date=BASE + timedelta(minutes=3, seconds=30), reverse=True, limit=2))
+    assert [m.id for m in got] == [4, 5]
+    got = run(svc.fetch(chat, query="nginx", from_date=BASE + timedelta(minutes=3), reverse=True, limit=5))
+    assert [m.id for m in got] == [4]
+
+
+def test_cross_chat_reply_is_not_followed():
+    from telethon import types
+
+    quote = msg(20, "quoting another chat")
+    quote.reply_to = types.MessageReplyHeader(reply_to_msg_id=2, reply_to_peer_id=types.PeerChannel(999))
+    svc = make_service([msg(2, "unrelated"), quote])
+    chat = next(iter(svc.chats.values()))
+    assert svc.to_view(quote, chat).reply_to_id is None
+
+
+def test_broadcast_post_without_comments_does_not_scan():
+    svc = make_service(THREAD, supports_replies=False, kind="channel")
+    chat = next(iter(svc.chats.values()))
+    assert run(svc.replies(chat, 2, 10)) == ([], 0)
+
+
+def test_forum_context_stays_in_topic():
+    from telethon import types
+
+    def in_topic(m, topic):
+        m.reply_to = types.MessageReplyHeader(reply_to_msg_id=topic, forum_topic=True)
+        return m
+
+    svc = make_service([in_topic(msg(i, f"m{i}"), 7 if i % 2 else 8) for i in range(9, 20)], forum=True)
+    chat = next(iter(svc.chats.values()))
+    ids = [m.id for m in run(svc.context(chat, 13, before=2, after=2))]
+    assert ids == [9, 11, 13, 15, 17]

@@ -44,6 +44,8 @@ def test_http_auth_and_concurrent_clients():
                 assert (await h.get(f"{base}/health")).json()["status"] == "ok"
                 assert (await h.post(f"{base}/mcp", json={})).status_code == 401
                 assert (await h.post(f"{base}/wrong-token/mcp", json={})).status_code == 401
+                assert (await h.get(f"{base}/.well-known/oauth-protected-resource")).status_code == 404
+                assert (await h.post(f"{base}/{TOKEN}x/mcp", json={})).status_code == 401
                 r = await h.post(f"{base}/mcp", json={}, headers={"Authorization": f"Bearer {TOKEN}"})
                 assert r.status_code != 401
 

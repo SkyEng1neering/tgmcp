@@ -140,7 +140,7 @@ _QUESTION_WORDS = (
     "could", "does anyone", "anyone know", "any idea", "help", "should i", "is it possible",
 )
 _QUESTION_START_RE = re.compile(
-    r"^\W*(" + "|".join(re.escape(w) for w in sorted(_QUESTION_WORDS, key=len, reverse=True)) + r")\b",
+    r"^\W*(" + "|".join(re.escape(w) for w in sorted(_QUESTION_WORDS, key=len, reverse=True)) + r")(?![\w-])",
     re.I,
 )
 

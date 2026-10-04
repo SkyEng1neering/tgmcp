@@ -30,6 +30,7 @@ MEDIA_FILTERS = {
 }
 
 _MAX_ANCESTOR_DEPTH = 15
+_SCAN_LIMIT = 2000  # messages scanned to rebuild reply trees where Telegram has no threads
 
 
 class AccessError(Exception):
@@ -61,7 +62,6 @@ def parse_when(value: str | None, *, end_of_day: bool = False) -> datetime | Non
 class Discussion:
     chat: ChatInfo
     root: MsgView
-    ancestors: list[MsgView] = field(default_factory=list)  # chain from root down to the hit's parent
     replies: list[MsgView] = field(default_factory=list)
     hit_ids: set[int] = field(default_factory=set)
     total_replies: int | None = None
@@ -289,6 +289,9 @@ class TelegramService:
         rt = msg.reply_to
         if not isinstance(rt, types.MessageReplyHeader):
             return None, (1 if forum else None)
+        if rt.reply_to_peer_id is not None and utils.get_peer_id(rt.reply_to_peer_id) != msg.chat_id:
+            # A quote of a message from another chat: its id means nothing here.
+            return None, (1 if forum else None)
         if forum and rt.forum_topic:
             if rt.reply_to_top_id:
                 return rt.reply_to_msg_id, rt.reply_to_top_id
@@ -296,6 +299,10 @@ class TelegramService:
         if forum:
             return rt.reply_to_msg_id, 1
         return rt.reply_to_msg_id, None
+
+    @staticmethod
+    def _rpc_error(chat: ChatInfo, e: Exception) -> AccessError:
+        return AccessError(f"{chat.title}: Telegram error {type(e).__name__}: {e}")
 
     def to_view(self, msg, chat: ChatInfo) -> MsgView:
         info = self._info_for_message(msg, chat)
@@ -373,36 +380,41 @@ class TelegramService:
             if media not in MEDIA_FILTERS:
                 raise ValueError(f"unknown media filter {media!r}; use one of {sorted(MEDIA_FILTERS)}")
             flt = MEDIA_FILTERS[media]
+        topic_filter = None
+        reply_to = None
+        if topic_id and chat.forum:
+            if query or flt or from_user or topic_id == 1:
+                # Telethon switches to GetReplies for reply_to and would silently drop search/filter/from_user;
+                # the General topic (id 1) has no thread to ask for. Read the chat and keep only this topic.
+                topic_filter = topic_id
+            else:
+                reply_to = topic_id
+        # Client-side filtering needs to look at more messages than it returns.
+        scan_cap = limit if name_filter is None and topic_filter is None else max(limit * 20, 1000)
         kwargs = dict(
-            limit=None,
+            limit=scan_cap,  # finite: with limit=None Telethon sleeps 1s between chunks
             search=query or None,
             filter=flt,
             from_user=from_user,
             offset_id=offset_id,
             min_id=min_id,
             reverse=reverse,
+            reply_to=reply_to,
         )
-        topic_filter = None
-        if topic_id and chat.forum:
-            if query or flt or from_user:
-                # Telethon switches to GetReplies for reply_to and would silently drop search/filter/from_user,
-                # so search the whole chat and keep only this topic.
-                topic_filter = topic_id
-            else:
-                kwargs["reply_to"] = topic_id
-        if reverse:
-            if from_date:
-                kwargs["offset_date"] = from_date
-        elif to_date:
-            kwargs["offset_date"] = to_date
         out: list[MsgView] = []
-        scanned = 0
-        # Client-side filtering needs to look at more messages than it returns.
-        scan_cap = limit if name_filter is None and topic_filter is None else max(limit * 20, 1000)
         async with self._sem:
             try:
+                if reverse and from_date:
+                    # Telegram's search treats the date as an upper bound even when paging forward, so turn
+                    # "after from_date" into an id bound that works for every request type.
+                    first = [m async for m in self.client.iter_messages(
+                        self.entity(chat), limit=1, offset_date=from_date, reverse=True, reply_to=reply_to)]
+                    if not first:
+                        return []
+                    kwargs["min_id"] = max(min_id, first[0].id - 1)
+                elif not reverse and to_date:
+                    kwargs["offset_date"] = to_date
                 async for msg in self.client.iter_messages(self.entity(chat), **kwargs):
-                    scanned += 1
                     if not reverse and from_date and msg.date < from_date:
                         break
                     if reverse and to_date and msg.date > to_date:
@@ -413,14 +425,12 @@ class TelegramService:
                     if (name_filter and name_filter not in view.sender.lower()) or (
                         topic_filter and view.topic_id != topic_filter
                     ):
-                        if scanned >= scan_cap:
-                            break
                         continue
                     out.append(view)
-                    if len(out) >= limit or scanned >= scan_cap:
+                    if len(out) >= limit:
                         break
             except errors.RPCError as e:
-                raise AccessError(f"{chat.title}: Telegram error {type(e).__name__}: {e}") from e
+                raise self._rpc_error(chat, e) from e
         return out
 
     async def get_by_ids(self, chat: ChatInfo, ids: list[int]) -> list[MsgView]:
@@ -432,12 +442,19 @@ class TelegramService:
             try:
                 msgs = await self.client.get_messages(self.entity(chat), ids=ids)
             except errors.RPCError as e:
-                raise AccessError(f"{chat.title}: Telegram error {type(e).__name__}: {e}") from e
+                raise self._rpc_error(chat, e) from e
         return [self.to_view(m, chat) for m in msgs if m is not None and not isinstance(m, types.MessageEmpty)]
 
     async def context(self, chat: ChatInfo, msg_id: int, before: int, after: int) -> list[MsgView]:
-        older = await self.fetch(chat, offset_id=msg_id + 1, limit=before + 1) if before >= 0 else []
-        newer = await self.fetch(chat, min_id=msg_id, limit=after, reverse=True) if after > 0 else []
+        topic = None
+        if chat.forum:
+            # In a forum, neighbouring ids belong to unrelated topics; stay inside the message's topic.
+            target = await self.get_by_ids(chat, [msg_id])
+            if not target:
+                return []
+            topic = target[0].topic_id
+        older = await self.fetch(chat, offset_id=msg_id + 1, limit=before + 1, topic_id=topic)
+        newer = await self.fetch(chat, min_id=msg_id, limit=after, reverse=True, topic_id=topic) if after > 0 else []
         msgs = {m.id: m for m in older + newer}
         return [msgs[k] for k in sorted(msgs)]
 
@@ -451,31 +468,32 @@ class TelegramService:
         if isinstance(ent, types.Channel):
             try:
                 async with self._sem:
-                    it = self.client.iter_messages(ent, reply_to=msg_id, limit=limit)
+                    # Oldest first: the first replies to a question are usually the answers.
+                    it = self.client.iter_messages(ent, reply_to=msg_id, limit=limit, reverse=True)
                     res = [self.to_view(m, chat) async for m in it]
                     total = getattr(it, "total", None)
-                res.reverse()
                 return res, total
             except errors.RPCError as e:
+                if chat.kind == "channel":
+                    return [], 0  # a broadcast post without comments
                 log.debug("GetReplies failed for %s/%s (%s), falling back to scan", chat.title, msg_id, e)
-        return await self._replies_by_scan(chat, msg_id, limit)
+        try:
+            return await self._replies_by_scan(chat, msg_id, limit)
+        except errors.RPCError as e:
+            raise self._rpc_error(chat, e) from e
 
     async def _replies_by_scan(self, chat: ChatInfo, msg_id: int, limit: int) -> tuple[list[MsgView], int | None]:
         """Fallback for basic groups: scan forward from the message and collect the reply tree."""
         tree = {msg_id}
         out: list[MsgView] = []
-        scanned = 0
         async with self._sem:
-            async for m in self.client.iter_messages(self.entity(chat), min_id=msg_id, reverse=True, limit=None):
-                scanned += 1
+            async for m in self.client.iter_messages(self.entity(chat), min_id=msg_id, reverse=True, limit=_SCAN_LIMIT):
                 rt = m.reply_to.reply_to_msg_id if isinstance(m.reply_to, types.MessageReplyHeader) else None
                 if rt in tree:
                     tree.add(m.id)
                     out.append(self.to_view(m, chat))
                     if len(out) >= limit:
                         break
-                if scanned >= 2000:
-                    break
         return out, None
 
     async def ancestors(self, chat: ChatInfo, msg: MsgView) -> list[MsgView]:
@@ -573,13 +591,24 @@ class TelegramService:
         qs = [m for m in candidates if looks_like_question(m.text)]
         qs.sort(key=lambda m: m.date, reverse=True)
         result: list[tuple[MsgView, list[MsgView] | None]] = []
+        lookups = 0
         for q in qs:
-            if len(result) >= limit:
+            if len(result) >= limit or lookups >= limit * 5:
                 break
             answers = None
             if include_answers or unanswered_only:
-                chat = self.chats[q.chat.id]
-                answers, _ = await self.replies(chat, q.id, max_answers)
+                chat = self.chats.get(q.chat.id)
+                if chat is None:
+                    continue
+                if q.replies == 0:
+                    answers = []  # Telegram already told us nobody replied
+                else:
+                    lookups += 1
+                    try:
+                        answers, _ = await self.replies(chat, q.id, max_answers)
+                    except AccessError as e:
+                        log.debug("replies lookup failed: %s", e)
+                        answers = []
                 # Replies from the asker themself are follow-ups, not answers.
                 answers_by_others = [a for a in answers if a.sender_id is None or a.sender_id != q.sender_id]
                 if unanswered_only and answers_by_others:
@@ -594,11 +623,15 @@ class TelegramService:
 
     async def _topics(self, chat: ChatInfo, query: str | None, limit: int) -> list[dict]:
         async with self._sem:
-            res = await self.client(
-                functions.messages.GetForumTopicsRequest(
-                    peer=self.entity(chat), offset_date=None, offset_id=0, offset_topic=0, limit=limit, q=query or None
+            try:
+                res = await self.client(
+                    functions.messages.GetForumTopicsRequest(
+                        peer=self.entity(chat), offset_date=None, offset_id=0, offset_topic=0, limit=limit,
+                        q=query or None,
+                    )
                 )
-            )
+            except errors.RPCError as e:
+                raise self._rpc_error(chat, e) from e
         out = []
         for t in res.topics:
             if isinstance(t, types.ForumTopicDeleted):

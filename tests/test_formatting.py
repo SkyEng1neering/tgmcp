@@ -38,6 +38,7 @@ def test_truncate():
         ("Does anyone know a good ORM", True),
         ("работает ли это?", True),
         ("Спасибо, всё заработало", False),
+        ("Что-то сломалось после обновления", False),
         ("ok", False),
         ("", False),
     ],

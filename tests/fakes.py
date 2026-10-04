@@ -82,11 +82,11 @@ class FakeClient:
         return [by_id.get(i) for i in ids]
 
 
-def make_service(messages, supports_replies: bool = True, forum: bool = False) -> TelegramService:
+def make_service(messages, supports_replies: bool = True, forum: bool = False, kind: str = "supergroup") -> TelegramService:
     cfg = Config(api_id=1, api_hash="x", session="s", chats=parse_chat_list("@devchat"))
     svc = TelegramService(cfg, client=FakeClient(messages, supports_replies))
-    chat = ChatInfo(id=marked_channel_id(CHANNEL_ID), title="Dev Chat", username="devchat", kind="supergroup", forum=forum)
+    chat = ChatInfo(id=marked_channel_id(CHANNEL_ID), title="Dev Chat", username="devchat", kind=kind, forum=forum)
     svc.chats = {chat.id: chat}
     svc._entities = {chat.id: types.Channel(id=CHANNEL_ID, title="Dev Chat", photo=types.ChatPhotoEmpty(),
-                                            date=BASE, megagroup=True)}
+                                            date=BASE, megagroup=kind == "supergroup")}
     return svc
