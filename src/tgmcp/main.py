@@ -75,8 +75,8 @@ async def telegram_watchdog(tg: TelegramService, on_fail, interval: float = 30, 
 
 async def run(config, transport: str, check: bool) -> None:
     tg = TelegramService(config)
-    await tg.start()
     try:
+        await tg.start()
         if check:
             print("Telegram session OK. Chats and what the server learned about them:\n")
             for c in tg.chats.values():

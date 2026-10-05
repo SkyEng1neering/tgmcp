@@ -27,8 +27,8 @@ class ChatProfile:
 
     @property
     def per_day(self) -> float | None:
-        if not self.sampled or self.span_days is None:
-            return None
+        if self.sampled < 5 or self.span_days is None:
+            return None  # a handful of messages says nothing about the pace
         return self.sampled / max(self.span_days, 1 / 24)
 
 
@@ -60,12 +60,22 @@ hello guys anybody question questions help
 STOPWORDS = frozenset(_STOP_RU + _STOP_EN)
 
 _URL_RE = re.compile(r"https?://\S+|t\.me/\S+|@\w+")
-_WORD_RE = re.compile(r"[a-zа-яё]+(?:-[a-zа-яё]+)?")
+_WORD_RE = re.compile(r"[^\W_]+(?:-[^\W_]+)?")
+_RU_ENDINGS = re.compile(
+    r"(иями|ями|ами|иях|ием|ией|ого|его|ому|ему|ыми|ими|ях|ах|ов|ев|ей|ой|ою|ую|юю|ью|ия|ие|ий|ии|ию|ый|ая|яя|ое|ее"
+    r"|ые|ых|их|ым|им|ом|ем|ам|ям|[аеёийоуыьэюя])$"
+)
 
 
 def _stem(word: str) -> str:
-    """Crude grouping key so визы/визу/визой count together (no morphology library on a small board)."""
-    return word[:6] if len(word) > 6 else word
+    """Crude grouping key so визы/визу/визой count together (no morphology library on a small board):
+    strip a common Russian inflectional ending, or a plural -s for Latin words, keeping at least 3 characters."""
+    if re.search(r"[а-яё]", word):
+        stem = _RU_ENDINGS.sub("", word)
+        return stem if len(stem) >= 3 else word
+    if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
 
 
 def extract_keywords(texts: list[str], top: int = 20, min_docs: int = 2) -> list[str]:
@@ -75,13 +85,14 @@ def extract_keywords(texts: list[str], top: int = 20, min_docs: int = 2) -> list
     for text in texts:
         seen = set()
         for w in _WORD_RE.findall(_URL_RE.sub(" ", text.lower())):
-            if len(w) < 4 or w in STOPWORDS:
+            if len(w) < 4 or w in STOPWORDS or not any(ch.isalpha() for ch in w):
                 continue
             key = _stem(w)
             forms.setdefault(key, Counter())[w] += 1
             seen.add(key)
         docs.update(seen)
-    ranked = [k for k, n in docs.most_common() if n >= min_docs]
+    # Deterministic order: messages mentioning the word, then total mentions, then the key itself.
+    ranked = sorted((k for k, n in docs.items() if n >= min_docs), key=lambda k: (-docs[k], -sum(forms[k].values()), k))
     return [forms[k].most_common(1)[0][0] for k in ranked[:top]]
 
 
@@ -120,10 +131,12 @@ def profile_from_sample(profile: ChatProfile, msgs: list[MsgView]) -> None:
 def is_unclear(c: ChatInfo) -> bool:
     """Too little signal to tell what the chat is about; the model should read its history before judging."""
     p: ChatProfile | None = c.profile
-    if p and len(p.keywords) >= 8:
-        return False  # a decent sample of real messages is the best signal
-    signals = sum((bool(c.about and len(c.about.strip()) >= 40), bool(p and p.pinned), bool(p and p.topics)))
-    return signals < 2
+    return not (
+        (c.about and len(c.about.strip()) >= 40)  # a real description
+        or (p and p.topics)  # forum topic names say what is discussed
+        or (p and p.pinned and len(p.pinned.strip()) >= 80)  # rules / FAQ in the pinned message
+        or (p and len(p.keywords) >= 8)  # a decent sample of real messages
+    )
 
 
 UNCLEAR_HINT = "profile is thin — read its recent messages with get_chat_history (limit 100-200) before deciding"
@@ -161,10 +174,23 @@ def format_catalog_entry(c: ChatInfo, compact: bool = False) -> str:
 
 
 def format_catalog(chats: list[ChatInfo], max_chars: int = 24_000) -> str:
-    text = "\n".join(format_catalog_entry(c) for c in chats)
-    if len(text) > max_chars:
-        text = "\n".join(format_catalog_entry(c, compact=True) for c in chats)
-    return truncate(text, max_chars)
+    """Catalog for the server instructions: full entries, compact ones if too long, and if even those don't fit,
+    whole entries up to the limit plus a note saying how many chats are missing (never a cut mid-entry)."""
+    entries: list[str] = []
+    for compact in (False, True):
+        entries = [format_catalog_entry(c, compact) for c in chats]
+        text = "\n".join(entries)
+        if len(text) <= max_chars:
+            return text
+    out: list[str] = []
+    used = 0
+    for i, e in enumerate(entries):
+        if used + len(e) + 1 > max_chars - 100:
+            out.append(f"(+{len(entries) - i} more chats not shown here; call list_chats to see all of them)")
+            break
+        out.append(e)
+        used += len(e) + 1
+    return "\n".join(out)
 
 
 def format_profile(c: ChatInfo) -> str:

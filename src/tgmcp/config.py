@@ -160,6 +160,9 @@ def load_config(env: dict | None = None, env_file: str | Path | None = None) -> 
         return value
 
     port = num("MCP_PORT", num("PORT", 8000, minimum=1), minimum=1)
+    profile_sample = num("TG_PROFILE_SAMPLE", 300, minimum=0)
+    if profile_sample > 3000:
+        raise ConfigError("TG_PROFILE_SAMPLE must be <= 3000 (30 Telegram requests per chat at startup)")
     log_level = (env.get("LOG_LEVEL") or "INFO").strip().upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ConfigError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
@@ -183,5 +186,5 @@ def load_config(env: dict | None = None, env_file: str | Path | None = None) -> 
         tg_parallel_requests=num("TG_PARALLEL_REQUESTS", 4, minimum=1),
         cache_ttl=num("TG_CACHE_TTL", 120.0, float, minimum=0),
         max_connections=num("MCP_MAX_CONNECTIONS", 256, minimum=1),
-        profile_sample=num("TG_PROFILE_SAMPLE", 300, minimum=0),
+        profile_sample=profile_sample,
     )

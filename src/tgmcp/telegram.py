@@ -32,7 +32,7 @@ MEDIA_FILTERS = {
 
 _MAX_ANCESTOR_DEPTH = 15
 _SCAN_LIMIT = 2000  # messages scanned to rebuild reply trees where Telegram has no threads
-_MAX_SCAN = 3000  # Telethon throttles iterations with limit > 3000 (1s per 100 messages)
+_MAX_SCAN = 3000  # upper bound on messages one request may page through (30 Telegram calls)
 
 
 class AccessError(Exception):
@@ -137,22 +137,24 @@ class TelegramService:
         """Learn what a chat is about: pinned message, forum topics and a sample of recent messages."""
         profile = ChatProfile()
         chat.profile = profile
+        # Best-effort: Telethon can also raise ValueError/ConnectionError on flaky links, and a missing profile
+        # must not stop the server from starting.
         try:
             pinned = await self.fetch(chat, media="pinned", limit=3)
             profile.pinned = "\n---\n".join(m.text for m in pinned if m.text) or None
-        except (AccessError, ValueError) as e:
-            log.debug("pinned of %s unavailable: %s", chat.title, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("pinned messages of %s unavailable: %s", chat.title, e)
         if chat.forum:
             try:
                 profile.topics = [t["title"] for t in await self.topics(chat, None, 100)]
-            except AccessError as e:
-                log.debug("topics of %s unavailable: %s", chat.title, e)
-        n = self.config.profile_sample
+            except Exception as e:  # noqa: BLE001
+                log.warning("topics of %s unavailable: %s", chat.title, e)
+        n = min(self.config.profile_sample, _MAX_SCAN)
         if n:
             try:
                 profile_from_sample(profile, await self.fetch(chat, limit=n))
-            except AccessError as e:
-                log.debug("sample of %s unavailable: %s", chat.title, e)
+            except Exception as e:  # noqa: BLE001
+                log.warning("message sample of %s unavailable: %s", chat.title, e)
         log.info(
             "Profiled %s: %d messages, %d topics, keywords: %s",
             chat.title, profile.sampled, len(profile.topics), ", ".join(profile.keywords[:8]) or "-",

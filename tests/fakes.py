@@ -59,6 +59,8 @@ class FakeClient:
             if not self.supports_replies:
                 raise errors.MsgIdInvalidError(request=None)
             items = [m for m in items if self._thread_root(m) == reply_to]
+        if filter is types.InputMessagesFilterPinned or isinstance(filter, types.InputMessagesFilterPinned):
+            items = [m for m in items if getattr(m, "pinned", False)]
         if search:
             items = [m for m in items if search.lower() in (m.message or "").lower()]
         if offset_id:

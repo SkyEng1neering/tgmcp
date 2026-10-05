@@ -83,3 +83,9 @@ def test_bad_numbers_and_log_level_are_config_errors():
         load_config({**BASE_ENV, "PORT": "abc"})
     with pytest.raises(ConfigError, match="LOG_LEVEL"):
         load_config({**BASE_ENV, "LOG_LEVEL": "verbose"})
+
+
+def test_profile_sample_is_capped():
+    with pytest.raises(ConfigError, match="TG_PROFILE_SAMPLE"):
+        load_config({**BASE_ENV, "TG_PROFILE_SAMPLE": "20000"})
+    assert load_config({**BASE_ENV, "TG_PROFILE_SAMPLE": "0"}).profile_sample == 0
