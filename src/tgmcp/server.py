@@ -25,9 +25,13 @@ CHATS AVAILABLE (profiled at startup from the description, pinned message, forum
 {catalog}
 
 Choosing where to search: match the user's question against the chats above and pass the relevant ones in
-`chats` (several if more than one fits). If the question is outside what these chats cover, say so and tell
-the user which subjects the chats do cover, instead of searching; only search everything if the user asks
-for that explicitly. `list_chats` gives fuller profiles (pinned message, all topics, recent questions).
+`chats` (several if more than one fits). `list_chats` gives fuller profiles (pinned message, all topics,
+recent questions). If a chat's profile does not make its subject clear (it is marked "profile is thin", or
+the words shown don't tell you enough), read the chat yourself: `get_chat_history` with limit 100-200 shows
+what people actually discuss there; judge from the messages and remember your conclusion for the rest of the
+conversation. Never declare a question out of scope while some chat's subject is still unclear to you.
+If, after that, the question is outside what these chats cover, say so and tell the user which subjects the
+chats do cover, instead of searching; only search everything if the user asks for that explicitly.
 
 Suggested workflow:
 1. Pick chats as described above.
@@ -334,7 +338,8 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         max_chars: MaxCharsArg = None,
     ) -> str:
         """Read messages of one chat without a search query: the latest messages, a date range, one forum topic or
-        one sender. Use it for "what's new / what was discussed last week" and to page through history."""
+        one sender. Use it for "what's new / what was discussed last week", to page through history, and to
+        understand what a chat is about when its profile is unclear (limit 100-200, judge from the messages)."""
         c = chat_or_error(chat)
         check_topic([c], topic_id)
         fd, td = dates(from_date, to_date)

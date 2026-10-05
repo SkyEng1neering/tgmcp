@@ -60,3 +60,19 @@ def test_catalog_falls_back_to_compact_when_too_long():
         chat.about = "x" * 500
         chats.append(chat)
     assert len(format_catalog(chats, max_chars=3000)) <= 3000 + 20
+
+
+def test_unclear_chats_are_flagged_for_reading_history():
+    from tgmcp.profiles import UNCLEAR_HINT, format_profile, is_unclear
+
+    svc = make_service([msg(1, "hi"), msg(2, "ok")])
+    chat = next(iter(svc.chats.values()))
+    asyncio.run(svc._profile(chat))
+    assert is_unclear(chat)
+    assert UNCLEAR_HINT in format_catalog([chat]) and UNCLEAR_HINT in format_profile(chat)
+
+    rich = make_service(SAMPLE * 3)
+    rchat = next(iter(rich.chats.values()))
+    rchat.about = "Чат про визы, ВНЖ, налоги и страховки на Кипре. Задавайте вопросы."
+    rchat.profile = ChatProfile(pinned="Правила чата и FAQ: t.me/cylaw/2")
+    assert not is_unclear(rchat)  # description + pinned are enough even without a sample

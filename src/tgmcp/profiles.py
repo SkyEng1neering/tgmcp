@@ -117,6 +117,18 @@ def profile_from_sample(profile: ChatProfile, msgs: list[MsgView]) -> None:
     profile.last_message = dates[-1]
 
 
+def is_unclear(c: ChatInfo) -> bool:
+    """Too little signal to tell what the chat is about; the model should read its history before judging."""
+    p: ChatProfile | None = c.profile
+    if p and len(p.keywords) >= 8:
+        return False  # a decent sample of real messages is the best signal
+    signals = sum((bool(c.about and len(c.about.strip()) >= 40), bool(p and p.pinned), bool(p and p.topics)))
+    return signals < 2
+
+
+UNCLEAR_HINT = "profile is thin — read its recent messages with get_chat_history (limit 100-200) before deciding"
+
+
 # --- rendering -------------------------------------------------------------------
 
 
@@ -143,6 +155,8 @@ def format_catalog_entry(c: ChatInfo, compact: bool = False) -> str:
             lines.append("  forum topics: " + "; ".join(p.topics[:n]) + (" …" if len(p.topics) > n else ""))
         if p.keywords:
             lines.append("  frequent words: " + ", ".join(p.keywords[: 8 if compact else 15]))
+    if is_unclear(c):
+        lines.append(f"  NOTE: {UNCLEAR_HINT}")
     return "\n".join(lines)
 
 
@@ -174,4 +188,6 @@ def format_profile(c: ChatInfo) -> str:
         if p.questions:
             lines.append("recent questions asked here:")
             lines += [f"  - {q}" for q in p.questions]
+    if is_unclear(c):
+        lines.append(f"NOTE: {UNCLEAR_HINT}")
     return "\n".join(lines)
