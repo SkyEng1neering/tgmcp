@@ -8,7 +8,7 @@ import logging
 import sys
 
 from .config import ConfigError, load_config
-from .formatting import format_chat
+from .profiles import format_profile
 from .server import build_server
 from .telegram import TelegramService
 
@@ -78,9 +78,9 @@ async def run(config, transport: str, check: bool) -> None:
     await tg.start()
     try:
         if check:
-            print("Telegram session OK. Allowed chats:")
+            print("Telegram session OK. Chats and what the server learned about them:\n")
             for c in tg.chats.values():
-                print(" -", format_chat(c))
+                print(format_profile(c), end="\n\n")
             for raw, err in tg.unresolved:
                 print(f" ! {raw}: {err}")
             return

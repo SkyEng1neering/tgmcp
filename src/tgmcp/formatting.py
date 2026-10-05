@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from .config import unmarked_channel_id
 
@@ -19,6 +20,7 @@ class ChatInfo:
     members: int | None = None
     about: str | None = None
     linked_chat_id: int | None = None
+    profile: Any = None  # profiles.ChatProfile, filled at startup
 
     @property
     def ref(self) -> str:
@@ -111,20 +113,6 @@ def format_message(
 
 def format_messages(msgs: list[MsgView], max_chars: int = 1500, show_chat: bool = True) -> str:
     return "\n\n".join(format_message(m, max_chars, show_chat) for m in msgs)
-
-
-def format_chat(c: ChatInfo) -> str:
-    parts = [f"{c.title}", f"ref: {c.ref}", f"id: {c.id}", f"type: {c.kind}"]
-    if c.forum:
-        parts.append("forum (has topics)")
-    if c.members:
-        parts.append(f"members: {c.members}")
-    if c.linked_chat_id:
-        parts.append(f"linked discussion chat id: {c.linked_chat_id}")
-    line = " | ".join(parts)
-    if c.about:
-        line += "\n  about: " + truncate(c.about.replace("\n", " "), 300)
-    return line
 
 
 # --- question detection -----------------------------------------------------

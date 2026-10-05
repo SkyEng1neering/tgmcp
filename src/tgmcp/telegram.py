@@ -14,6 +14,7 @@ from telethon.sessions import StringSession
 from .config import ChatRef, Config, marked_channel_id
 from .formatting import ChatInfo, MsgView, looks_like_question
 from .limits import TTLCache
+from .profiles import ChatProfile, profile_from_sample
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +131,32 @@ class TelegramService:
         for raw, err in self.unresolved:
             log.warning("Chat %r skipped: %s", raw, err)
         log.info("Allowed chats: %s", ", ".join(f"{c.title} ({c.ref})" for c in self.chats.values()))
+        await asyncio.gather(*(self._profile(c) for c in self.chats.values()))
+
+    async def _profile(self, chat: ChatInfo) -> None:
+        """Learn what a chat is about: pinned message, forum topics and a sample of recent messages."""
+        profile = ChatProfile()
+        chat.profile = profile
+        try:
+            pinned = await self.fetch(chat, media="pinned", limit=3)
+            profile.pinned = "\n---\n".join(m.text for m in pinned if m.text) or None
+        except (AccessError, ValueError) as e:
+            log.debug("pinned of %s unavailable: %s", chat.title, e)
+        if chat.forum:
+            try:
+                profile.topics = [t["title"] for t in await self.topics(chat, None, 100)]
+            except AccessError as e:
+                log.debug("topics of %s unavailable: %s", chat.title, e)
+        n = self.config.profile_sample
+        if n:
+            try:
+                profile_from_sample(profile, await self.fetch(chat, limit=n))
+            except AccessError as e:
+                log.debug("sample of %s unavailable: %s", chat.title, e)
+        log.info(
+            "Profiled %s: %d messages, %d topics, keywords: %s",
+            chat.title, profile.sampled, len(profile.topics), ", ".join(profile.keywords[:8]) or "-",
+        )
 
     async def stop(self) -> None:
         await self.client.disconnect()

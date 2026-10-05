@@ -12,16 +12,25 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import __version__
-from .formatting import fmt_date, format_chat, format_message, format_messages
+from .formatting import fmt_date, format_message, format_messages
 from .limits import BusyError, CallGate
+from .profiles import format_catalog, format_profile
 from .telegram import AccessError, Discussion, FollowUp, TelegramService, parse_when
 
 INSTRUCTIONS = """\
-This server gives read-only access to a fixed list of Telegram chats (communities, channels, forums)
-so you can find what people asked, discussed and answered there. You cannot send anything.
+This server is a guide to a fixed set of Telegram chats (communities, channels, forums): it finds what people
+asked, discussed and answered there. Access is read-only; nothing can be sent.
+
+CHATS AVAILABLE (profiled at startup from the description, pinned message, forum topics and recent messages):
+{catalog}
+
+Choosing where to search: match the user's question against the chats above and pass the relevant ones in
+`chats` (several if more than one fits). If the question is outside what these chats cover, say so and tell
+the user which subjects the chats do cover, instead of searching; only search everything if the user asks
+for that explicitly. `list_chats` gives fuller profiles (pinned message, all topics, recent questions).
 
 Suggested workflow:
-1. `list_chats` once to see which chats exist and what they are about.
+1. Pick chats as described above.
 2. `search_discussions` for "how did people solve X / what do people think about Y" questions — it
    returns whole conversations: the question, reply-linked answers AND the messages written right after it
    without the reply button (tagged "after"; many people answer that way, but some of those are unrelated
@@ -125,7 +134,7 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
     mcp = MCPServer(
         "tgmcp",
         title="Telegram chat search",
-        instructions=INSTRUCTIONS,
+        instructions=INSTRUCTIONS.format(catalog=format_catalog(list(tg.chats.values()))),
         version=__version__,
     )
     mcp.gate = gate  # exposed for the /health endpoint
@@ -175,11 +184,12 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
 
     @tool
     async def list_chats() -> str:
-        """List the Telegram chats this server may read: titles, ids, type, whether it is a forum, description."""
-        out = [f"{len(tg.chats)} allowed chats:"]
-        out += [f"- {format_chat(c)}" for c in tg.chats.values()]
+        """Full profiles of the chats this server covers: description, pinned message, forum topics, activity,
+        frequent words and recent questions. Use it to decide which chats fit a question and what they can answer."""
+        out = [f"{len(tg.chats)} chats available:", ""]
+        out += [format_profile(c) + "\n" for c in tg.chats.values()]
         if tg.unresolved:
-            out.append("\nConfigured but unavailable: " + "; ".join(f"{r} ({e})" for r, e in tg.unresolved))
+            out.append("Configured but unavailable: " + "; ".join(f"{r} ({e})" for r, e in tg.unresolved))
         return "\n".join(out)
 
     @tool

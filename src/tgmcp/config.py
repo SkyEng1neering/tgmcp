@@ -53,6 +53,7 @@ class Config:
     tg_parallel_requests: int = 4  # concurrent requests to Telegram
     cache_ttl: float = 120.0  # seconds to reuse identical Telegram reads; 0 disables
     max_connections: int = 256  # HTTP connections handled at once (uvicorn limit_concurrency)
+    profile_sample: int = 300  # recent messages read per chat at startup to learn what the chat is about
 
 
 _INVITE_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w-]+)", re.I)
@@ -182,4 +183,5 @@ def load_config(env: dict | None = None, env_file: str | Path | None = None) -> 
         tg_parallel_requests=num("TG_PARALLEL_REQUESTS", 4, minimum=1),
         cache_ttl=num("TG_CACHE_TTL", 120.0, float, minimum=0),
         max_connections=num("MCP_MAX_CONNECTIONS", 256, minimum=1),
+        profile_sample=num("TG_PROFILE_SAMPLE", 300, minimum=0),
     )
