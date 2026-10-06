@@ -141,3 +141,26 @@ def test_tiny_sample_has_no_activity_rate():
     svc = make_service([msg(1, "одно сообщение в чате")])
     profile_from_sample(p, asyncio.run(svc.fetch(next(iter(svc.chats.values())), limit=10)))
     assert p.sampled == 1 and p.per_day is None
+
+
+def test_question_line_skips_greeting_and_channels_get_headlines():
+    from tgmcp.profiles import _question_line
+
+    assert _question_line("Добрый день!\nПодскажите, где купить марки?\nСпасибо") == "Подскажите, где купить марки?"
+    assert _question_line("Всем привет! Кто знает хорошего врача?") == "Всем привет! Кто знает хорошего врача?"
+    chan = make_service([msg(1, "💳 Revolut: как это работает?\nДлинный текст"), msg(2, "Кипр переходит на зимнее время")],
+                        kind="channel")
+    chat = next(iter(chan.chats.values()))
+    p = ChatProfile()
+    profile_from_sample(p, asyncio.run(chan.fetch(chat, limit=10)))
+    assert p.questions == [] and p.headlines == ["Кипр переходит на зимнее время", "💳 Revolut: как это работает?"]
+
+
+def test_noise_words_and_months_are_not_keywords():
+    texts = ["меня через вроде пока точно чтоб лучше сентября октября сообщения пишите"] * 3 + ["виза виза", "визы"]
+    assert extract_keywords(texts) == ["виза"]
+
+
+def test_keywords_show_the_shortest_form():
+    texts = ["на кипре хорошо", "в кипре тепло", "кипр остров", "лимассоле жарко", "лимассоле дорого", "лимассол"]
+    assert extract_keywords(texts) == ["кипр", "лимассол"]

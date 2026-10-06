@@ -20,7 +20,8 @@ class ChatProfile:
     pinned: str | None = None
     topics: list[str] = field(default_factory=list)  # forum topic titles
     keywords: list[str] = field(default_factory=list)
-    questions: list[str] = field(default_factory=list)  # recent questions people asked, first lines
+    questions: list[str] = field(default_factory=list)  # recent questions people asked, one line each
+    headlines: list[str] = field(default_factory=list)  # broadcast channels: first lines of recent posts
     sampled: int = 0  # messages analysed
     span_days: float | None = None  # time covered by the sample
     last_message: datetime | None = None
@@ -56,8 +57,30 @@ must need never only other others ought ours over please same should since some 
 thank thanks that their theirs them then there these they thing think this those though through thus
 very want was were what whatever when where whether which while will with within without would your yours
 hello guys anybody question questions help
+nothing good first last next time long today tomorrow yesterday someone anyone everyone really maybe
 """.split()
-STOPWORDS = frozenset(_STOP_RU + _STOP_EN)
+_STOP_MORE = """
+меня тебя мне тебе нас вас нам вам ими ему ней ним нем нём них нею мной тобой вами нами
+мой моя мое моё мои твой твоя твое твои ваш ваша ваше ваши вашего вашей вашему вашим наш наша наше наши нашего нашей
+сам сама само сами самому самой самого самое самый самая самые
+один одна одно одни одного одной одним одних другой другая другое другие другого другой других
+весь вся всё все всего всей всем всех всеми этот эта это эти этого этой этому этим этих тот та то те того той тому
+такой такая такое такие такого такую таким таких
+через вроде пока точно чтоб чтобы лучше хорошо скорее туда сюда здесь там тут назад вперёд вперед внутри рядом около
+после перед между потом сразу снова опять почти совсем вообще прямо именно кстати например просто тоже также ещё еще
+интересно понял поняла понятно спасибо пожалуйста извините привет здравствуйте добрый доброе доброго день дня
+утро утром вечер вечера вечером ночь ночью сегодня завтра вчера сейчас
+чат чата чате чаты сообщение сообщения сообщении пишите напишите напиши пишут писать написать закреп закрепе
+закреплённое закрепленное информация информации посмотрите смотрите ссылка ссылке ссылку верху
+случае случай вопрос вопросы ответ ответы помочь помогу помогите подскажите подскажи посоветуйте
+буду будем будет будут была были было быть есть нет нету
+любой любая любое любые каждый каждая каждое каждые многие некоторые несколько
+первое второе третье первый второй третий
+января февраля марта апреля мая июня июля августа сентября октября ноября декабря
+январь февраль март апрель июнь июль август сентябрь октябрь ноябрь декабрь
+минут минуты минута часа часов часы неделю недели неделя месяц месяца месяцев года году лет
+""".split()
+STOPWORDS = frozenset(_STOP_RU + _STOP_EN + _STOP_MORE)
 
 _URL_RE = re.compile(r"https?://\S+|t\.me/\S+|@\w+")
 _WORD_RE = re.compile(r"[^\W_]+(?:-[^\W_]+)?")
@@ -93,17 +116,26 @@ def extract_keywords(texts: list[str], top: int = 20, min_docs: int = 2) -> list
         docs.update(seen)
     # Deterministic order: messages mentioning the word, then total mentions, then the key itself.
     ranked = sorted((k for k, n in docs.items() if n >= min_docs), key=lambda k: (-docs[k], -sum(forms[k].values()), k))
-    return [forms[k].most_common(1)[0][0] for k in ranked[:top]]
+    # Show the shortest form of each group (usually the nominative: кипр rather than кипре), ties by frequency.
+    return [min(forms[k], key=lambda f: (len(f), -forms[k][f], f)) for k in ranked[:top]]
 
 
-def sample_questions(msgs: list[MsgView], limit: int = 12) -> list[str]:
-    """First lines of the most recent distinct questions (bots excluded)."""
+def _question_line(text: str) -> str:
+    """The line of a message that carries the question (skipping greetings like 'Добрый день!')."""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    return next((ln for ln in lines if looks_like_question(ln)), lines[0] if lines else "")
+
+
+def _recent_lines(msgs: list[MsgView], pick, limit: int) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for m in sorted(msgs, key=lambda m: m.date, reverse=True):
-        if m.sender.endswith("[bot]") or not looks_like_question(m.text):
+        if m.sender.endswith("[bot]") or not m.text:
             continue
-        line = truncate(m.text.strip().splitlines()[0].strip(), 140)
+        line = pick(m.text)
+        if not line:
+            continue
+        line = truncate(line, 140)
         key = line.lower()
         if key in seen:
             continue
@@ -114,6 +146,16 @@ def sample_questions(msgs: list[MsgView], limit: int = 12) -> list[str]:
     return out
 
 
+def sample_questions(msgs: list[MsgView], limit: int = 12) -> list[str]:
+    """The most recent distinct questions people asked, one line each (bots excluded)."""
+    return _recent_lines([m for m in msgs if looks_like_question(m.text)], _question_line, limit)
+
+
+def sample_headlines(msgs: list[MsgView], limit: int = 12) -> list[str]:
+    """First lines of the most recent posts — for broadcast channels, where nobody asks questions."""
+    return _recent_lines(msgs, lambda t: t.strip().splitlines()[0].strip(), limit)
+
+
 def profile_from_sample(profile: ChatProfile, msgs: list[MsgView]) -> None:
     """Fill keyword/question/activity fields of `profile` from a sample of recent messages."""
     msgs = [m for m in msgs if not m.service]
@@ -121,7 +163,10 @@ def profile_from_sample(profile: ChatProfile, msgs: list[MsgView]) -> None:
         return
     texts = [m.text for m in msgs if m.text and not m.sender.endswith("[bot]")]
     profile.keywords = extract_keywords(texts)
-    profile.questions = sample_questions(msgs)
+    if msgs[0].chat.kind == "channel":
+        profile.headlines = sample_headlines(msgs)
+    else:
+        profile.questions = sample_questions(msgs)
     profile.sampled = len(msgs)
     dates = sorted(m.date for m in msgs)
     profile.span_days = (dates[-1] - dates[0]).total_seconds() / 86400
@@ -214,6 +259,9 @@ def format_profile(c: ChatInfo) -> str:
         if p.questions:
             lines.append("recent questions asked here:")
             lines += [f"  - {q}" for q in p.questions]
+        if p.headlines:
+            lines.append("recent posts:")
+            lines += [f"  - {h}" for h in p.headlines]
     if is_unclear(c):
         lines.append(f"NOTE: {UNCLEAR_HINT}")
     return "\n".join(lines)
