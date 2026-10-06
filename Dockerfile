@@ -14,7 +14,7 @@ USER tgmcp
 ENV MCP_TRANSPORT=http MCP_HOST=0.0.0.0 MCP_PORT=8000
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
     CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"MCP_PORT\",\"8000\")}/health', timeout=4)"
 
 CMD ["tgmcp"]
