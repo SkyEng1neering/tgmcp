@@ -43,9 +43,11 @@ def test_http_auth_and_concurrent_clients():
             async with httpx.AsyncClient() as h:
                 assert (await h.get(f"{base}/health")).json()["status"] == "ok"
                 assert (await h.post(f"{base}/mcp", json={})).status_code == 401
-                assert (await h.post(f"{base}/wrong-token/mcp", json={})).status_code == 401
+                assert (await h.post(f"{base}/wrong-token/mcp", json={})).status_code == 404
                 assert (await h.get(f"{base}/.well-known/oauth-protected-resource")).status_code == 404
-                assert (await h.post(f"{base}/{TOKEN}x/mcp", json={})).status_code == 401
+                assert (await h.get(f"{base}/.well-known/oauth-protected-resource/{TOKEN}/mcp")).status_code == 404
+                assert (await h.post(f"{base}/register", json={})).status_code == 404  # OAuth probe: nothing here
+                assert (await h.post(f"{base}/{TOKEN}x/mcp", json={})).status_code == 404
                 r = await h.post(f"{base}/mcp", json={}, headers={"Authorization": f"Bearer {TOKEN}"})
                 assert r.status_code != 401
                 # Behind a reverse proxy the Host header is the public domain even though we bind 127.0.0.1.

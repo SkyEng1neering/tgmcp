@@ -15,12 +15,19 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 log = logging.getLogger("tgmcp.http")
 
-_SECRET_SEGMENT = re.compile(r"^/[^/]{16,}(?=/|$)")  # the token (or an attempt at it) in front of /mcp
+# A path segment that looks like a token (long, with digits or capitals — unlike words such as
+# "oauth-authorization-server"): the real one in front of /mcp, a wrong one, or the real one that an OAuth-probing
+# client copies into /.well-known/oauth-protected-resource/<token>/mcp.
+_LONG_SEGMENT = re.compile(r"/([A-Za-z0-9_\-~.%]{16,})(?=/|$)")
 _MAX_BODY_INSPECT = 64 * 1024
 
 
 def mask_path(path: str) -> str:
-    return _SECRET_SEGMENT.sub("/<token>", path)
+    def hide(m: re.Match) -> str:
+        seg = m.group(1)
+        return "/<token>" if re.search(r"[0-9A-Z]", seg) else m.group(0)
+
+    return _LONG_SEGMENT.sub(hide, path)
 
 
 def describe_rpc(body: bytes) -> str:

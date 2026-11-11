@@ -3,6 +3,10 @@
 Two ways to present the token, both checked in constant time:
   * ``Authorization: Bearer <token>`` header (Claude Code, Claude Desktop, scripts);
   * a secret path prefix ``/<token>/mcp`` — for clients such as claude.ai custom connectors that only take a URL.
+
+Without a valid token, only the MCP endpoint itself answers 401 (so a client using the header sees why). Every other
+path answers 404: MCP clients probe OAuth endpoints (/.well-known/..., /register) before connecting, and a 401 there
+makes them believe the server wants an OAuth sign-in that it cannot offer.
 """
 
 from __future__ import annotations
@@ -16,9 +20,10 @@ PUBLIC_PATHS = {"/health"}
 
 
 class TokenAuthMiddleware:
-    def __init__(self, app: ASGIApp, token: str):
+    def __init__(self, app: ASGIApp, token: str, endpoint: str = "/mcp"):
         self.app = app
         self.token = token
+        self.endpoint = endpoint
         self._prefix = f"/{token}"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -43,12 +48,11 @@ class TokenAuthMiddleware:
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
             return
-        if path.startswith("/.well-known/"):
-            # No OAuth here: a 404 tells MCP clients probing for OAuth metadata to stop instead of
-            # starting an authorization flow that cannot succeed.
-            await self._reply(send, 404, {"error": "not_found"})
+        if path.rstrip("/") == self.endpoint:
+            await self._reply(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", b'Bearer realm="tgmcp"')])
             return
-        await self._reply(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", b'Bearer realm="tgmcp"')])
+        # /.well-known/*, /register, /token, /authorize, a wrong token in front of /mcp, anything else: not here.
+        await self._reply(send, 404, {"error": "not_found"})
 
     @staticmethod
     async def _reply(send: Send, status: int, payload: dict, extra_headers: list | None = None) -> None:

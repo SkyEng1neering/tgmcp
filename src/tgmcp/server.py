@@ -101,6 +101,9 @@ def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
+UNCAPPED_TOOLS = {"list_chats"}  # the catalog must never be cut: a hidden chat is a chat the model won't use
+
+
 def _args_summary(kwargs: dict) -> str:
     given = {k: v for k, v in kwargs.items() if v not in (None, "", [])}
     text = ", ".join(f"{k}={v!r}" for k, v in given.items())
@@ -168,7 +171,11 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
             outcome = "ok"
             try:
                 result = await asyncio.wait_for(run(args, kwargs), cfg.call_timeout)
-                if isinstance(result, str) and len(result) > cfg.max_result_chars:
+                if (
+                    isinstance(result, str)
+                    and len(result) > cfg.max_result_chars
+                    and fn.__name__ not in UNCAPPED_TOOLS
+                ):
                     outcome = f"ok, truncated from {len(result)} chars"
                     result = result[: cfg.max_result_chars].rstrip() + (
                         f"\n\n…[result cut at {cfg.max_result_chars} chars — narrow `chats`, use fewer queries or "

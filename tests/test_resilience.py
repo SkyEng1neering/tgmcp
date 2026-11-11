@@ -146,7 +146,11 @@ def test_replies_fall_back_when_peer_is_invalid():
 
 def test_request_log_masks_token_and_names_the_tool(caplog):
     assert mask_path("/abcdefghijklmnopqrstuvwxyz0123/mcp") == "/<token>/mcp"
+    assert mask_path("/.well-known/oauth-protected-resource/gFic1-Bd1u3dIXLn5urJMTdLIgA4b/mcp") == (
+        "/.well-known/oauth-protected-resource/<token>/mcp"
+    )
     assert mask_path("/mcp") == "/mcp" and mask_path("/health") == "/health"
+    assert mask_path("/.well-known/oauth-authorization-server") == "/.well-known/oauth-authorization-server"
     assert describe_rpc(b'{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_messages"}}') == (
         "tools/call search_messages"
     )
@@ -173,5 +177,21 @@ def test_request_log_masks_token_and_names_the_tool(caplog):
             await RequestLogMiddleware(app)(scope, receive, send)
         assert "POST /<token>/mcp [tools/call get_thread] -> 200" in caplog.text
         assert "from 203.0.113.9" in caplog.text and "abcdefghijklmnop" not in caplog.text
+
+    asyncio.run(go())
+
+
+def test_list_chats_is_never_cut():
+    async def go():
+        svc = _configure(make_service(MSGS), max_result_chars=2000)
+        chat = next(iter(svc.chats.values()))
+        chat.about = "описание чата " * 50
+        chat.profile = None
+        from tgmcp.profiles import ChatProfile
+
+        chat.profile = ChatProfile(pinned="закреп " * 100, questions=[f"вопрос {i} " * 10 for i in range(12)])
+        async with Client(build_server(svc)) as c:
+            res = await c.call_tool("list_chats", {})
+        assert len(res.content[0].text) > 2000 and "result cut" not in res.content[0].text
 
     asyncio.run(go())
