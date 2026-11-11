@@ -154,7 +154,7 @@ Claude Desktop (`claude_desktop_config.json`):
 Чтобы отличить проблемы сервера от проблем внешнего пути (туннель, DNS, провайдер), полезно раз в минуту проверять `/health` снаружи и изнутри. Строка для `crontab -e` на сервере (подставьте свой адрес):
 
 ```
-* * * * * (curl -s -m 20 -o /dev/null -w "$(date -u +\%FT\%TZ) funnel %{http_code} %{time_total}s" https://<ваш-адрес>/health; echo; curl -s -m 5 -o /dev/null -w "$(date -u +\%FT\%TZ) local %{http_code} %{time_total}s" http://127.0.0.1:8002/health; echo) >> $HOME/tgmcp-health.log 2>&1
+* * * * * (curl -s -m 20 -o /dev/null -w "$(date -u +\%FT\%TZ) funnel \%{http_code} \%{time_total}s" https://<ваш-адрес>/health; echo; curl -s -m 5 -o /dev/null -w "$(date -u +\%FT\%TZ) local \%{http_code} \%{time_total}s" http://127.0.0.1:8002/health; echo) >> $HOME/tgmcp-health.log 2>&1
 ```
 
 Если лог Docker обрывается на середине и `docker logs` жалуется на `invalid character '\x00'`, файл лога повреждён (обычно после отключения питания). Лечится пересозданием контейнера: `docker compose up -d --force-recreate`.
