@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import logging
+import time
 from datetime import timedelta
 from typing import Annotated, Literal
 
@@ -16,6 +19,8 @@ from .formatting import fmt_date, format_message, format_messages
 from .limits import BusyError, CallGate
 from .profiles import format_catalog, format_profile
 from .telegram import AccessError, Discussion, FollowUp, TelegramService, parse_when
+
+log = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
 This server is a guide to a fixed set of Telegram chats (communities, channels, forums): it finds what people
@@ -96,6 +101,12 @@ def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
+def _args_summary(kwargs: dict) -> str:
+    given = {k: v for k, v in kwargs.items() if v not in (None, "", [])}
+    text = ", ".join(f"{k}={v!r}" for k, v in given.items())
+    return "{" + (text if len(text) <= 300 else text[:300] + "…") + "}"
+
+
 def _render_discussion(title: str, d: Discussion, max_chars: int) -> str:
     """Root, then replies and follow-ups in chronological order.
 
@@ -144,15 +155,50 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
     mcp.gate = gate  # exposed for the /health endpoint
 
     def tool(fn):
-        """Register a read-only tool whose executions are queued through the shared CallGate."""
+        """Register a read-only tool: queued through the shared CallGate, bounded in time and output size,
+        with one log line per call so failures seen by the client can be matched against the server."""
+
+        async def run(args, kwargs):
+            async with gate.slot():
+                return await fn(*args, **kwargs)
 
         @functools.wraps(fn)
         async def gated(*args, **kwargs):
+            started = time.monotonic()
+            outcome = "ok"
             try:
-                async with gate.slot():
-                    return await fn(*args, **kwargs)
+                result = await asyncio.wait_for(run(args, kwargs), cfg.call_timeout)
+                if isinstance(result, str) and len(result) > cfg.max_result_chars:
+                    outcome = f"ok, truncated from {len(result)} chars"
+                    result = result[: cfg.max_result_chars].rstrip() + (
+                        f"\n\n…[result cut at {cfg.max_result_chars} chars — narrow `chats`, use fewer queries or "
+                        "lower the limits to see everything]"
+                    )
+                return result
             except BusyError as e:
+                outcome = "busy"
                 raise ToolError(str(e)) from e
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+                raise ToolError(
+                    f"{fn.__name__} took longer than {cfg.call_timeout:.0f}s and was cancelled. Narrow `chats`, use "
+                    "fewer queries or lower the limits, then retry."
+                ) from None
+            except ToolError as e:
+                outcome = f"error: {str(e)[:120]}"
+                raise
+            except (ConnectionError, OSError) as e:
+                outcome = f"telegram unreachable: {e}"
+                raise ToolError(
+                    "Telegram is unreachable from the server right now (network problem on the server side). "
+                    "Retry in a minute."
+                ) from e
+            except Exception as e:  # noqa: BLE001 - make sure unexpected failures are visible in the log
+                outcome = f"crash: {type(e).__name__}: {str(e)[:120]}"
+                raise
+            finally:
+                log.info("tool %s %s -> %s in %.1fs", fn.__name__, _args_summary(kwargs), outcome,
+                         time.monotonic() - started)
 
         return mcp.tool(annotations=RO)(gated)
 
@@ -236,9 +282,9 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
         to_date: ToArg = None,
         sender: SenderArg = None,
         topic_id: TopicArg = None,
-        max_discussions: Annotated[int, Field(description="How many threads to expand", ge=1, le=20)] = 6,
-        max_replies: Annotated[int, Field(description="Max reply-linked messages per thread", ge=1, le=200)] = 40,
-        follow_ups: FollowUpsArg = 10,
+        max_discussions: Annotated[int, Field(description="How many threads to expand", ge=1, le=20)] = 5,
+        max_replies: Annotated[int, Field(description="Max reply-linked messages per thread", ge=1, le=200)] = 25,
+        follow_ups: FollowUpsArg = 6,
         follow_window_hours: FollowWindowArg = 24,
         max_chars: MaxCharsArg = None,
     ) -> str:
@@ -260,7 +306,7 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
             msg = f"No messages found for {queries!r}. Try other keywords/stems/synonyms or a wider date range."
             return msg + ("\nErrors: " + "; ".join(errs) if errs else "")
         ds = await tg.discussions(hits, max_discussions, max_replies, _follow(follow_ups, follow_window_hours))
-        mc = chars(max_chars) if max_chars else min(default_chars, 800)
+        mc = chars(max_chars) if max_chars else min(default_chars, 500)
         parts = [f"{len(ds)} discussion(s) for {queries!r} ({len(hits)} matching messages)."]
         if errs:
             parts.append("Errors: " + "; ".join(errs))
@@ -286,8 +332,8 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
                   "follow_window_hours (in busy chats unrelated chatter also counts, so this is conservative)"),
         ] = False,
         limit: Annotated[int, Field(description="Max questions to return", ge=1, le=50)] = 15,
-        max_answers: Annotated[int, Field(description="Max reply-linked answers per question", ge=1, le=100)] = 15,
-        follow_ups: FollowUpsArg = 8,
+        max_answers: Annotated[int, Field(description="Max reply-linked answers per question", ge=1, le=100)] = 10,
+        follow_ups: FollowUpsArg = 5,
         follow_window_hours: FollowWindowArg = 24,
         scan_per_chat: Annotated[
             int, Field(description="How many matching/recent messages to scan per chat and query", ge=20, le=1000)
@@ -310,7 +356,7 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
             raise ToolError(str(e)) from e
         if not found:
             return "No questions found. Try other keywords, a wider date range or a larger scan_per_chat."
-        mc = chars(max_chars) if max_chars else min(default_chars, 800)
+        mc = chars(max_chars) if max_chars else min(default_chars, 500)
         parts = [f"{len(found)} question(s):"]
         for i, d in enumerate(found, 1):
             if include_answers:
@@ -390,8 +436,8 @@ def build_server(tg: TelegramService, gate: CallGate | None = None) -> MCPServer
     async def get_thread(
         chat: ChatArg,
         message_id: int,
-        max_replies: Annotated[int, Field(ge=1, le=300)] = 100,
-        follow_ups: FollowUpsArg = 15,
+        max_replies: Annotated[int, Field(ge=1, le=300)] = 60,
+        follow_ups: FollowUpsArg = 10,
         follow_window_hours: FollowWindowArg = 24,
         max_chars: MaxCharsArg = None,
     ) -> str:

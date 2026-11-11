@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 
 from .config import ConfigError, load_config
 from .profiles import format_profile
@@ -22,18 +23,27 @@ def build_http_app(mcp, config, tg: TelegramService):
     from mcp.server.transport_security import TransportSecuritySettings
 
     from .auth import TokenAuthMiddleware
+    from .httplog import RequestLogMiddleware
+
+    started_at = time.monotonic()
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_: Request) -> JSONResponse:
-        ok = tg.client.is_connected()
+        if not tg.client.is_connected():
+            status = "telegram_disconnected"
+        elif not tg.authorized:
+            status = "telegram_unauthorized"
+        else:
+            status = "ok"
         return JSONResponse(
             {
-                "status": "ok" if ok else "telegram_disconnected",
+                "status": status,
                 "chats": len(tg.chats),
+                "uptime_s": int(time.monotonic() - started_at),
                 "calls": mcp.gate.stats(),
                 "cache": {"hits": tg.cache.hits, "misses": tg.cache.misses},
             },
-            status_code=200 if ok else 503,
+            status_code=200 if status == "ok" else 503,
         )
 
     # Stateless + JSON responses: survives restarts and plays well with reverse proxies.
@@ -49,34 +59,42 @@ def build_http_app(mcp, config, tg: TelegramService):
         app = TokenAuthMiddleware(app, config.auth_token)
     else:
         log.warning("MCP_ALLOW_NO_AUTH is set: the HTTP endpoint is open to anyone who can reach it")
-    return app
+    return RequestLogMiddleware(app)
 
 
-async def telegram_watchdog(tg: TelegramService, on_fail, interval: float = 30, max_failures: int = 5) -> None:
-    """Reconnect if Telethon's own auto-reconnect gave up; stop the server if Telegram stays unreachable so the
-    supervisor (docker `restart: unless-stopped`) starts a fresh process."""
+async def telegram_watchdog(tg: TelegramService, interval: float = 30) -> None:
+    """Reconnect when Telethon's own auto-reconnect has given up (it stops after a few attempts).
+
+    The process keeps running through a network outage: restarting it would only add a minute of re-profiling to
+    every outage. While disconnected, tool calls return a clear "retry in a minute" error and /health reports it.
+    """
     failures = 0
     while True:
         await asyncio.sleep(interval)
         if tg.client.is_connected():
+            if failures:
+                log.info("Telegram connection is back after %d failed attempts", failures)
+                try:
+                    tg.authorized = await tg.client.is_user_authorized()
+                    if not tg.authorized:
+                        log.error("Telegram session is no longer authorized: run `tgmcp-login` and update TG_SESSION")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Could not verify the session after reconnecting: %s", e)
             failures = 0
             continue
         failures += 1
-        log.warning("Telegram disconnected, reconnecting (attempt %d/%d)", failures, max_failures)
+        log.warning("Telegram disconnected, reconnecting (attempt %d)", failures)
         try:
-            await tg.client.connect()
+            await asyncio.wait_for(tg.client.connect(), 60)
         except Exception as e:  # noqa: BLE001
             log.warning("Reconnect failed: %s", e)
-        if not tg.client.is_connected() and failures >= max_failures:
-            log.error("Telegram unreachable, shutting down so the process gets restarted")
-            on_fail()
-            return
 
 
 async def run(config, transport: str, check: bool) -> None:
     tg = TelegramService(config)
     try:
-        await tg.start()
+        # A server keeps trying through a network outage; --check should report it and exit instead.
+        await tg.start(retry_forever=not check)
         if check:
             print("Telegram session OK. Chats and what the server learned about them:\n")
             for c in tg.chats.values():
@@ -104,15 +122,14 @@ async def run(config, transport: str, check: bool) -> None:
                 log_level=config.log_level.lower(),
                 access_log=False,  # the access log would print the secret path
                 limit_concurrency=config.max_connections,  # beyond this uvicorn answers 503 instead of falling over
-                timeout_keep_alive=30,
+                # Longer than the 90s idle timeout of Go reverse proxies (Tailscale serve/funnel, Caddy), so the
+                # proxy never reuses a connection the server has just closed.
+                timeout_keep_alive=120,
                 timeout_graceful_shutdown=20,
             )
         )
 
-        def fail():
-            server.should_exit = True
-
-        watchdog = asyncio.create_task(telegram_watchdog(tg, fail))
+        watchdog = asyncio.create_task(telegram_watchdog(tg))
         try:
             await server.serve()
         finally:

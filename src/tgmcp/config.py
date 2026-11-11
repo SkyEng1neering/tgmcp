@@ -54,6 +54,8 @@ class Config:
     cache_ttl: float = 120.0  # seconds to reuse identical Telegram reads; 0 disables
     max_connections: int = 256  # HTTP connections handled at once (uvicorn limit_concurrency)
     profile_sample: int = 300  # recent messages read per chat at startup to learn what the chat is about
+    call_timeout: float = 50.0  # seconds a tool call may take (queue + work) before the client gets an error
+    max_result_chars: int = 30_000  # one tool result is cut at this size so long conversations stay usable
 
 
 _INVITE_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w-]+)", re.I)
@@ -187,4 +189,6 @@ def load_config(env: dict | None = None, env_file: str | Path | None = None) -> 
         cache_ttl=num("TG_CACHE_TTL", 120.0, float, minimum=0),
         max_connections=num("MCP_MAX_CONNECTIONS", 256, minimum=1),
         profile_sample=profile_sample,
+        call_timeout=num("MCP_CALL_TIMEOUT", 50.0, float, minimum=5),
+        max_result_chars=num("MCP_MAX_RESULT_CHARS", 30_000, minimum=2000),
     )

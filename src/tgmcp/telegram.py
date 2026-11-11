@@ -116,11 +116,30 @@ class TelegramService:
         self._sem = asyncio.Semaphore(config.tg_parallel_requests)
         self.cache = TTLCache(config.cache_ttl)
         self.unresolved: list[tuple[str, str]] = []
+        self.authorized = True  # flipped by the watchdog if Telegram revokes the session
 
     # --- lifecycle -----------------------------------------------------------
 
-    async def start(self) -> None:
-        await self.client.connect()
+    # Pauses between attempts to reach Telegram when the network is down (then stays at the last value).
+    reconnect_delays: tuple[float, ...] = (5, 10, 20, 40, 60)
+
+    async def connect(self, *, retry_forever: bool) -> None:
+        """Connect to Telegram; with retry_forever, keep trying through a network outage instead of giving up."""
+        attempt = 0
+        while True:
+            try:
+                await asyncio.wait_for(self.client.connect(), 120)
+                return
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                if not retry_forever:
+                    raise
+                delay = self.reconnect_delays[min(attempt, len(self.reconnect_delays) - 1)]
+                attempt += 1
+                log.warning("Telegram unreachable (%s); retrying in %.0fs", e, delay)
+                await asyncio.sleep(delay)
+
+    async def start(self, *, retry_forever: bool = False) -> None:
+        await self.connect(retry_forever=retry_forever)
         if not await self.client.is_user_authorized():
             raise RuntimeError("TG_SESSION is not authorized: run `tgmcp-login` again to get a fresh session string")
         me = await self.client.get_me()
@@ -535,8 +554,9 @@ class TelegramService:
                     res = [self.to_view(m, chat) async for m in it]
                     total = getattr(it, "total", None)
                 return res, total
-            except errors.MsgIdInvalidError as e:
-                # The message has no reply thread (e.g. a post without comments).
+            except (errors.MsgIdInvalidError, errors.PeerIdInvalidError) as e:
+                # The message has no reply thread (e.g. a post without comments, or one from before the group
+                # became a supergroup).
                 if chat.kind == "channel":
                     return [], 0
                 log.debug("GetReplies failed for %s/%s (%s), falling back to scan", chat.title, msg_id, e)
@@ -624,8 +644,8 @@ class TelegramService:
         )
         out: list[MsgView] = []
         for m in msgs:
-            if m.id in thread or m.service:
-                continue
+            if m.id in thread or m.service or not m.text.strip():
+                continue  # a bare photo/sticker written after the question carries nothing for the reader
             if m.reply_to_id and m.reply_to_id not in thread:
                 continue
             thread.add(m.id)
@@ -642,7 +662,7 @@ class TelegramService:
             chat, offset_id=msg.id, limit=fu.preceding, from_date=msg.date - fu.window,
             topic_id=msg.topic_id if chat.forum else None,
         )
-        return [m for m in reversed(msgs) if not m.service]
+        return [m for m in reversed(msgs) if not m.service and m.text.strip()]
 
     async def expand(
         self,
